@@ -1616,16 +1616,19 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
             // Phase 1: Pull all four belts tight simultaneously to eliminate slack
             if (!initial_tension_complete) {
                 diagnosticStage("horizontal_initial_tighten");
-                if (Maslow.axis[_TL].pull_tight(current)) {
+                // pull_tight() stops and resets its ramp on success. Calling it
+                // again would restart a completed motor while other axes finish.
+                // These flags record completion, not a guarantee of retained tension.
+                if (!tight[_TL] && Maslow.axis[_TL].pull_tight(current)) {
                     tight[_TL] = true;
                 }
-                if (Maslow.axis[_TR].pull_tight(current)) {
+                if (!tight[_TR] && Maslow.axis[_TR].pull_tight(current)) {
                     tight[_TR] = true;
                 }
-                if (Maslow.axis[_BL].pull_tight(current)) {
+                if (!tight[_BL] && Maslow.axis[_BL].pull_tight(current)) {
                     tight[_BL] = true;
                 }
-                if (Maslow.axis[_BR].pull_tight(current)) {
+                if (!tight[_BR] && Maslow.axis[_BR].pull_tight(current)) {
                     tight[_BR] = true;
                 }
 
@@ -1633,6 +1636,11 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
                                     | (tight[_BL] ? 4U : 0U) | (tight[_BR] ? 8U : 0U);
                 // Once all belts are tight, move to phase 2
                 if (tight[_TL] && tight[_TR] && tight[_BL] && tight[_BR]) {
+                    // The next phase pulls the bottom axes one at a time. Explicitly
+                    // clear both outputs so the waiting axis cannot retain a command
+                    // from this phase. stop() does not provide active position hold.
+                    Maslow.axis[_BL].stop();
+                    Maslow.axis[_BR].stop();
                     initial_tension_complete = true;
                     // Set TL and TR targets to their current positions to prevent unwanted movement
                     Maslow.axis[_TL].setTarget(Maslow.axis[_TL].getPosition());
