@@ -10,6 +10,7 @@
 #include <cmath>
 #include <new>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -440,6 +441,15 @@ bool Calibration::requestStateChange(int newState) {
                 // the first run or a re-run after a failure).  Reset waypoint counters and fitness
                 // tracking so stale data from any previous run cannot affect this run.
                 if (currentState == EXTENDEDOUT) {
+                    diagnosticPhase = nullptr;
+                    diagnosticWaypoint = -1;
+                    diagnosticRun = -1;
+                    diagnosticTightMask = 0;
+                    diagnosticCurrentThreshold = 0;
+                    diagnosticPhaseStart = diagnosticLastLog = millis();
+                    for (int arm = 0; arm < ARM_COUNT; ++arm)
+                        diagnosticEncoderBaseline[arm] = Maslow.axis[arm].getEncoderReadFailures();
+                    log_info("CALDIAG v2 enabled: logging only; snapshots 500ms; no diagnostic timeouts");
                     waypoint            = 0;
                     recomputeCountIndex = 0;
                     previousFitnessRms  = -1.0;
@@ -615,6 +625,43 @@ bool Calibration::requestStateChange(int newState) {
     printCurrentState();
 
     return success;
+}
+
+// Stage names describe the next control operation; snapshots show the last PWM command.
+void Calibration::diagnosticStage(const char* stage) {
+    if (!calibrationInProgress || currentState != CALIBRATION_IN_PROGRESS) return;
+    if (diagnosticPhase && strcmp(diagnosticPhase, stage) == 0) return;
+    diagnosticPhase = stage;
+    diagnosticPhaseStart = millis();
+    diagnosticSnapshot();
+}
+
+void Calibration::diagnosticSnapshot() {
+    diagnosticLastLog = millis();
+    log_info("CALDIAG stage=" << (diagnosticPhase ? diagnosticPhase : "start")
+             << " wp=" << waypoint << " run=" << diagnosticRun
+             << " elapsed_ms=" << static_cast<uint32_t>(diagnosticLastLog - diagnosticPhaseStart)
+             << " tight_mask=" << diagnosticTightMask
+             << " threshold_adc=" << diagnosticCurrentThreshold);
+    const char* labels[] = { "TL", "TR", "BL", "BR" };
+    for (int arm = 0; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        log_info("CALDIAG " << labels[arm] << " pos=" << axis.getPosition()
+                 << " target=" << axis.getTarget() << " pwm=" << axis.getMotorPower()
+                 << " current_adc=" << axis.getMotorCurrent()
+                 << " enc_fail_run=" << (axis.getEncoderReadFailures() - diagnosticEncoderBaseline[arm]));
+    }
+}
+
+// Logging has no authority over motor outputs, errors, or calibration state.
+void Calibration::diagnosticUpdate() {
+    if (!calibrationInProgress || currentState != CALIBRATION_IN_PROGRESS) return;
+    if (diagnosticWaypoint != waypoint) {
+        diagnosticWaypoint = waypoint;
+        diagnosticPhase = nullptr;
+        diagnosticPhaseStart = millis();
+    }
+    if (millis() - diagnosticLastLog >= 500UL) diagnosticSnapshot();
 }
 
 // -Maslow homing loop. This is used whenver any of the homing funcitons are active (belts extending or retracting)
@@ -1172,6 +1219,7 @@ bool Calibration::updateExtendDistanceFromAnchors() {
 
 // --Maslow calibration loop
 void Calibration::calibration_loop() {
+    diagnosticUpdate();
     serviceCalibrationWatchdogs(false);
 
     if (waypoint >
@@ -1470,6 +1518,9 @@ bool Calibration::computeXYfromLengths(double TL, double TR, float& x, float& y)
  */
 bool Calibration::take_measurement(float result[4], int dir, int run, int current, int waypoint) {
     serviceCalibrationWatchdogs(false);
+    diagnosticRun = run;
+    diagnosticCurrentThreshold = current;
+    if (orientation == VERTICAL || waypoint > 5) diagnosticStage("measure");
 
     //Shouldn't this be handled with the same code as below but with the direction set to UP?
     if (orientation == VERTICAL) {
@@ -1564,6 +1615,7 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
 
             // Phase 1: Pull all four belts tight simultaneously to eliminate slack
             if (!initial_tension_complete) {
+                diagnosticStage("horizontal_initial_tighten");
                 if (Maslow.axis[_TL].pull_tight(current)) {
                     tight[_TL] = true;
                 }
@@ -1577,6 +1629,8 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
                     tight[_BR] = true;
                 }
 
+                diagnosticTightMask = (tight[_TL] ? 1U : 0U) | (tight[_TR] ? 2U : 0U)
+                                    | (tight[_BL] ? 4U : 0U) | (tight[_BR] ? 8U : 0U);
                 // Once all belts are tight, move to phase 2
                 if (tight[_TL] && tight[_TR] && tight[_BL] && tight[_BR]) {
                     initial_tension_complete = true;
@@ -1590,6 +1644,9 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
                 return false;
             }
 
+            diagnosticTightMask = (tight[_TL] ? 1U : 0U) | (tight[_TR] ? 2U : 0U)
+                                | (tight[_BL] ? 4U : 0U) | (tight[_BR] ? 8U : 0U);
+            diagnosticStage("horizontal_measure_bottom");
             // Phase 2: Hold TL and TR in position, then pull BL and BR based on x-coordinate
             // This ensures TL and TR remain as stable reference points for position calculation
             Maslow.axis[_TL].recomputePID();
@@ -1953,6 +2010,7 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
 
 // Move pulling just two belts depending in the direction of the movement
 bool Calibration::move_with_slack(double fromX, double fromY, double toX, double toY) {
+    diagnosticStage("move");
     serviceCalibrationWatchdogs(false);
 
     //This is where we want to introduce some slack so the system
@@ -2436,6 +2494,8 @@ void Calibration::deallocateCalibrationMemory() {
 
 // Function to reset all calibration state variables to initial values
 void Calibration::resetCalibrationState() {
+    diagnosticPhase = nullptr;
+    diagnosticWaypoint = -1;
     // Reset calibration progress variables
     waypoint               = 0;
     pointCount             = 0;
@@ -2696,6 +2756,7 @@ bool Calibration::detectOrientation() {
 
     // Phase 1: Record starting positions (once at beginning)
     if (!orientationDetectionDone && elapsedTime < STARTUP_DELAY_MS) {
+        diagnosticStage("orientation_start");
         // Only record and log on first cycle (elapsedTime will be very small)
         if (elapsedTime < 10) {  // First few milliseconds only
             tlStartPosition = Maslow.axis[_TL].getPosition();
@@ -2709,6 +2770,7 @@ bool Calibration::detectOrientation() {
     // In vertical orientation, gravity assists and belts extend significantly
     // In horizontal orientation, belts extend minimally despite motor drive
     if (!orientationDetectionDone && elapsedTime >= STARTUP_DELAY_MS && elapsedTime < (STARTUP_DELAY_MS + ORIENTATION_DETECT_DURATION_MS)) {
+        diagnosticStage("orientation_extend");
         // Drive TL and TR motors at 70% speed in extend direction
         Maslow.axis[_TL].driveOut(ORIENTATION_DETECT_SPEED);
         Maslow.axis[_TR].driveOut(ORIENTATION_DETECT_SPEED);
@@ -2747,6 +2809,9 @@ bool Calibration::detectOrientation() {
         Maslow.axis[_TL].setTarget(tlStartPosition);
         Maslow.axis[_TR].setTarget(trStartPosition);
 
+        log_info("CALDIAG orientation_return_start TL=" << tlStartPosition << " TR=" << trStartPosition
+                 << " TL_now=" << tlCurrentPosition << " TR_now=" << trCurrentPosition);
+        diagnosticStage("orientation_return");
         orientationDetectionDone = true;
         return false;
     }
@@ -2779,6 +2844,8 @@ bool Calibration::detectOrientation() {
             // Check if settling pause is complete
             if (millis() - settlingStartTime >= MOTOR_SETTLING_PAUSE_MS) {
                 settlingStartTime = 0;     // Reset for next calibration run
+                log_info("CALDIAG orientation_return_complete");
+                diagnosticStage("measurement_start");
                 settlingCompleted = true;  // Mark settling as complete to prevent re-running detection
                 return true;
             }

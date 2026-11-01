@@ -91,6 +91,18 @@ public:
     int currentState = UNKNOWN;
 
 private:
+    // Diagnostic firmware: logging only; never changes motion or error state.
+    void diagnosticStage(const char* stage);
+    void diagnosticSnapshot();
+    void diagnosticUpdate();
+    const char* diagnosticPhase = nullptr;
+    unsigned long diagnosticPhaseStart = 0;
+    unsigned long diagnosticLastLog = 0;
+    int diagnosticWaypoint = -1;
+    int diagnosticRun = -1;
+    int diagnosticCurrentThreshold = 0;
+    unsigned diagnosticTightMask = 0;
+    uint32_t diagnosticEncoderBaseline[ARM_COUNT] = {};
     //Variables used for retracting state
     bool axis_homed[4]         = { false, false, false, false };
     bool retracting[ARM_COUNT] = { false, false, false, false };

@@ -15,7 +15,8 @@
 
 class MotorUnit {
 public:
-    void     begin(int forwardPin, int backwardPin, int readbackPin, int encoderAddress, int channel1, int channel2);
+    void     begin(int forwardPin, int backwardPin, int readbackPin, int encoderAddress, int channel1, int channel2,
+                   bool reverseEncoder = false);
     void     zero();
     void     setTarget(double newTarget);
     double   getTarget();
@@ -30,6 +31,7 @@ public:
     double   getPositionError();
     void     stop();
     bool     updateEncoderPosition();
+    uint32_t getEncoderReadFailures() const { return encoderReadFailures; }
     double   recomputePID();
     void     decompressBelt();
     void     driveOut(int speed);  // Drive motor outward at specified PWM speed (0-1023)
@@ -51,6 +53,7 @@ public:
     bool   onTarget(double precision);
 
 private:
+    uint32_t encoderReadFailures = 0;  // Cumulative since boot, including mux selection failures.
     int     _encoderAddress;
     AS5600  encoder;
     MiniPID positionPID;  //These are the P,I,D values for the servo motors

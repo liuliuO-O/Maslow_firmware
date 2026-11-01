@@ -16,7 +16,8 @@
 //------------------------------------------------------ Core utility functions
 //------------------------------------------------------
 
-void MotorUnit::begin(int forwardPin, int backwardPin, int readbackPin, int encoderAddress, int channel1, int channel2) {
+void MotorUnit::begin(int forwardPin, int backwardPin, int readbackPin, int encoderAddress, int channel1, int channel2,
+                      bool reverseEncoder) {
     _encoderAddress = encoderAddress;
 
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
@@ -28,6 +29,11 @@ void MotorUnit::begin(int forwardPin, int backwardPin, int readbackPin, int enco
         Maslow.errorMessage = "Encoder not found on " + encAddrLabel;
     } else {
         log_info("Encoder connected on " << encAddrLabel.c_str());
+    }
+    // Apply software direction before zeroing so cumulative counts use the same angle convention.
+    encoder.setDirection(reverseEncoder ? AS5600_COUNTERCLOCK_WISE : AS5600_CLOCK_WISE);
+    if (reverseEncoder) {
+        log_info(encAddrLabel.c_str() << " encoder software reversal enabled");
     }
     zero();
 
@@ -116,8 +122,10 @@ void MotorUnit::update() {
 
 // Reads the encoder value and updates it's position
 bool MotorUnit::updateEncoderPosition() {
-    if (!Maslow.I2CMux.setPort(_encoderAddress))
+    if (!Maslow.I2CMux.setPort(_encoderAddress)) {
+        ++encoderReadFailures;
         return false;
+    }
 
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
 
@@ -127,6 +135,7 @@ bool MotorUnit::updateEncoderPosition() {
         // Check for I2C communication errors using new AS5600 error handling
         int error = encoder.lastError();
         if (error != 0) {  // AS5600_OK = 0
+            ++encoderReadFailures;
             if (millis() - encoderReadFailurePrintTime > 5000) {
                 encoderReadFailurePrintTime = millis();
                 log_warn("Encoder I2C error " << error << " on " << encAddrLabel.c_str());
@@ -139,6 +148,7 @@ bool MotorUnit::updateEncoderPosition() {
         log_warn("Encoder read failure on " << encAddrLabel.c_str());
         //Maslow.panic();
     }
+    ++encoderReadFailures;
     return false;
 }
 
@@ -239,10 +249,24 @@ bool MotorUnit::pull_tight(int currentThreshold) {
 
     if (retract_speed > 15) {  //20 is not the actual speed, it is the amount of time so we don't trigger immediately
         if (currentMeasurement > currentThreshold || incrementalThresholdHits > 2) {
+            // Capture the values used by the original decision before stop/reset.
+            // Report only after stopping; do not add ADC reads or change the condition.
+            const double diagnosticPWM = _commandPWM;
+            const float diagnosticBaseline = retract_baseline;
+            const int diagnosticHits = incrementalThresholdHits;
+            const bool diagnosticAbsolute = currentMeasurement > currentThreshold;
+            const bool diagnosticIncrement = incrementalThresholdHits > 2;
             //stop motor, reset variables
             stop();
             retract_speed    = 0;
             retract_baseline = 700;
+            log_info("CALDIAG tight_success axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
+                     << " reason=" << (diagnosticAbsolute ? (diagnosticIncrement ? "both" : "absolute") : "increment")
+                     << " adc=" << currentMeasurement << " threshold=" << currentThreshold
+                     << " baseline=" << diagnosticBaseline
+                     << " delta=" << (currentMeasurement - diagnosticBaseline)
+                     << " delta_threshold=" << incrementalThreshold << " hits=" << diagnosticHits
+                     << " pwm_before_stop=" << diagnosticPWM << " pos=" << getPosition());
             return true;
         } else {
             return false;
