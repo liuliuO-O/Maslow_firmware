@@ -150,6 +150,21 @@ bool MotorUnit::updateEncoderPosition() {
         if (abs(countDelta) > 1536) {
             ++encoderDiagnosticSuppressed;
             if (now - encoderDiagnosticLastPrintTime >= 250) {
+                // These extra I2C reads are diagnostic only.  Keep them out of
+                // the normal sampling path so they cannot reduce encoder rate.
+                const uint8_t magnetStatus = encoder.readStatus();
+                int diagnosticI2CError     = encoder.lastError();
+                int agc                    = -1;
+                int magnitude              = -1;
+                if (diagnosticI2CError == AS5600_OK) {
+                    agc                = encoder.readAGC();
+                    diagnosticI2CError = encoder.lastError();
+                }
+                if (diagnosticI2CError == AS5600_OK) {
+                    magnitude          = encoder.readMagnitude();
+                    diagnosticI2CError = encoder.lastError();
+                }
+
                 log_warn("CALDIAG encoder_step axis=" << encAddrLabel.c_str()
                          << " sensor_raw=" << encoder.getLastSensorAngle()
                          << " directed=" << encoder.getLastReadAngle()
@@ -159,6 +174,13 @@ bool MotorUnit::updateEncoderPosition() {
                          << " cumulative_counts=" << cumulativeCounts
                          << " dt_ms=" << static_cast<unsigned int>(now - encoderDiagnosticLastTime)
                          << " pwm=" << _commandPWM
+                         << " magnet_status=" << static_cast<unsigned int>(magnetStatus)
+                         << " magnet_detected=" << static_cast<unsigned int>((magnetStatus & 0x20) != 0)
+                         << " magnet_high=" << static_cast<unsigned int>((magnetStatus & 0x08) != 0)
+                         << " magnet_low=" << static_cast<unsigned int>((magnetStatus & 0x10) != 0)
+                         << " agc=" << agc
+                         << " magnitude=" << magnitude
+                         << " diag_i2c_error=" << diagnosticI2CError
                          << " suppressed=" << encoderDiagnosticSuppressed);
                 encoderDiagnosticLastPrintTime = now;
                 encoderDiagnosticSuppressed = 0;
