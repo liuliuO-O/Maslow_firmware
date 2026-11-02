@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 class EncoderPositionTest(unittest.TestCase):
-    def test_unwrap_uses_motor_direction_only_for_ambiguous_motion(self):
+    def test_unwrap_uses_shortest_delta_across_zero(self):
         root = Path(__file__).resolve().parents[2]
         source = textwrap.dedent(r'''
             #include "EncoderPosition.h"
@@ -16,21 +16,14 @@ class EncoderPositionTest(unittest.TestCase):
                 using MaslowEncoder::unwrapDelta;
 
                 // Normal wrap-around while stationary/manual movement.
-                assert(unwrapDelta(4000, 100, 0) == 196);
-                assert(unwrapDelta(100, 4000, 0) == -196);
+                assert(unwrapDelta(4000, 100) == 196);
+                assert(unwrapDelta(100, 4000) == -196);
+                assert(unwrapDelta(1000, 990) == -10);
+                assert(unwrapDelta(1000, 1010) == 10);
 
-                // Samples from the observed one-direction retract sequence.
-                // Increasing encoder counts resolves both sides consistently.
-                assert(unwrapDelta(2964, 1238, 1) == 2370);
-                assert(unwrapDelta(1238, 2996, 1) == 1758);
-
-                // Extend uses decreasing encoder counts.
-                assert(unwrapDelta(1238, 2996, -1) == -2338);
-                assert(unwrapDelta(2996, 1416, -1) == -1580);
-
-                // Small backlash must not be expanded into a full turn.
-                assert(unwrapDelta(1000, 990, 1) == -10);
-                assert(unwrapDelta(1000, 1010, -1) == 10);
+                // Never invent a nearly complete revolution from one sample.
+                assert(unwrapDelta(500, 4032) == -564);
+                assert(unwrapDelta(4032, 500) == 564);
             }
         ''')
         with tempfile.TemporaryDirectory() as tmp:

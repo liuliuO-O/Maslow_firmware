@@ -430,7 +430,7 @@ float AS5600::getAngularSpeed(uint8_t mode)
 //
 //  POSITION cumulative
 //
-int32_t AS5600::getCumulativePosition(bool update, int8_t expectedDirection)
+int32_t AS5600::getCumulativePosition(bool update)
 {
   if (update)
   {
@@ -441,7 +441,7 @@ int32_t AS5600::getCumulativePosition(bool update, int8_t expectedDirection)
     }
   }
   const uint16_t value = _lastReadAngle;
-  _position += MaslowEncoder::unwrapDelta(_lastPosition, value, expectedDirection);
+  _position += MaslowEncoder::unwrapDelta(_lastPosition, value);
   _lastPosition = value;
   return _position;
 }

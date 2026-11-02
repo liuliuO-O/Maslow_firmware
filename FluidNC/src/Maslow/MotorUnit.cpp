@@ -129,18 +129,7 @@ bool MotorUnit::updateEncoderPosition() {
 
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
 
-    // Belt position is the inverse of encoder counts, so inward (negative PWM)
-    // normally increases counts and outward (positive PWM) decreases them.
-    // Use that known direction only for substantial drive; preserve small
-    // backlash or externally forced motion instead of inventing a revolution.
-    int8_t expectedEncoderDirection = 0;
-    if (_commandPWM <= -100) {
-        expectedEncoderDirection = 1;
-    } else if (_commandPWM >= 100) {
-        expectedEncoderDirection = -1;
-    }
-
-    const int32_t cumulativeCounts = encoder.getCumulativePosition(true, expectedEncoderDirection);
+    const int32_t cumulativeCounts = encoder.getCumulativePosition();
 
     // Check the angle transaction directly.  A separate isConnected() probe on
     // every sample doubled I2C traffic and reduced the effective sample rate.
@@ -170,7 +159,6 @@ bool MotorUnit::updateEncoderPosition() {
                          << " cumulative_counts=" << cumulativeCounts
                          << " dt_ms=" << static_cast<unsigned int>(now - encoderDiagnosticLastTime)
                          << " pwm=" << _commandPWM
-                         << " expected_count_direction=" << static_cast<int>(expectedEncoderDirection)
                          << " suppressed=" << encoderDiagnosticSuppressed);
                 encoderDiagnosticLastPrintTime = now;
                 encoderDiagnosticSuppressed = 0;

@@ -68,9 +68,8 @@ static constexpr bool trEncoderReversed = false;
 // Maximum allowed interval between Maslow.update() calls before triggering emergency stop
 #define UPDATE_WATCHDOG_MS 100
 
-// Each axis is sampled at this rate.  The scheduler spaces the four I2C reads
-// evenly; the old millisecond timer produced only one sample per axis every
-// 7-10ms despite its nominal 1000Hz setting.
+// Read all four axes in one batch.  The old round-robin scheduler did one axis
+// per main-loop pass, leaving 7-10ms between samples of the same encoder.
 static constexpr uint32_t ENCODER_READ_FREQUENCY_HZ = 250;
 
 //------------------------------------------------------
@@ -328,24 +327,24 @@ void Maslow_::update() {
 //------------------------------------------------------ Position Control Functions
 //------------------------------------------------------
 
-// Update encoder positions round-robin at ENCODER_READ_FREQUENCY_HZ per axis.
+// Update all four encoder positions as one batch at the per-axis target rate.
 bool Maslow_::updateEncoderPositions() {
     bool            success           = true;
     static uint32_t lastEncoderReadUs = micros();
-    static int      encoderToRead      = _TL;
 
     static int           encoderFailCounter[4] = { 0, 0, 0, 0 };
     static unsigned long encoderFailTimer      = millis();
 
-    constexpr uint32_t encoderReadPeriodUs   = 1000000UL / (ENCODER_READ_FREQUENCY_HZ * ARM_COUNT);
+    constexpr uint32_t encoderReadPeriodUs   = 1000000UL / ENCODER_READ_FREQUENCY_HZ;
     constexpr int      encoderLines[ARM_COUNT] = { TLEncoderLine, TREncoderLine, BLEncoderLine, BREncoderLine };
     const uint32_t     nowUs = micros();
     if (!readingFromSD && static_cast<uint32_t>(nowUs - lastEncoderReadUs) >= encoderReadPeriodUs) {
-        if (!axis[encoderToRead].updateEncoderPosition()) {
-            encoderFailCounter[encoderLines[encoderToRead]]++;
-        }
-        encoderToRead   = (encoderToRead + 1) % ARM_COUNT;
         lastEncoderReadUs = nowUs;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            if (!axis[arm].updateEncoderPosition()) {
+                encoderFailCounter[encoderLines[arm]]++;
+            }
+        }
     }
 
     // if more than 1% of readings fail, warn user, if more than 10% fail, stop the machine and raise alarm
