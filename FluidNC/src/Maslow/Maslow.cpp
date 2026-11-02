@@ -68,7 +68,10 @@ static constexpr bool trEncoderReversed = false;
 // Maximum allowed interval between Maslow.update() calls before triggering emergency stop
 #define UPDATE_WATCHDOG_MS 100
 
-int ENCODER_READ_FREQUENCY_HZ = 1000;  //max frequency for polling the encoders
+// Each axis is sampled at this rate.  The scheduler spaces the four I2C reads
+// evenly; the old millisecond timer produced only one sample per axis every
+// 7-10ms despite its nominal 1000Hz setting.
+static constexpr uint32_t ENCODER_READ_FREQUENCY_HZ = 250;
 
 //------------------------------------------------------
 //------------------------------------------------------ Main Function Loops
@@ -325,43 +328,24 @@ void Maslow_::update() {
 //------------------------------------------------------ Position Control Functions
 //------------------------------------------------------
 
-//updating encoder positions for all 4 arms, cycling through them each call, at ENCODER_READ_FREQUENCY_HZ frequency
+// Update encoder positions round-robin at ENCODER_READ_FREQUENCY_HZ per axis.
 bool Maslow_::updateEncoderPositions() {
-    bool                 success               = true;
-    static unsigned long lastCallToEncoderRead = millis();
+    bool            success           = true;
+    static uint32_t lastEncoderReadUs = micros();
+    static int      encoderToRead      = _TL;
 
     static int           encoderFailCounter[4] = { 0, 0, 0, 0 };
     static unsigned long encoderFailTimer      = millis();
 
-    if (!readingFromSD && (millis() - lastCallToEncoderRead > 1000 / (ENCODER_READ_FREQUENCY_HZ))) {
-        static int encoderToRead = 0;
-        switch (encoderToRead) {
-            case 0:
-                if (!axis[_TL].updateEncoderPosition()) {
-                    encoderFailCounter[TLEncoderLine]++;
-                }
-                break;
-            case 1:
-                if (!axis[_TR].updateEncoderPosition()) {
-                    encoderFailCounter[TREncoderLine]++;
-                }
-                break;
-            case 2:
-                if (!axis[_BL].updateEncoderPosition()) {
-                    encoderFailCounter[BLEncoderLine]++;
-                }
-                break;
-            case 3:
-                if (!axis[_BR].updateEncoderPosition()) {
-                    encoderFailCounter[BREncoderLine]++;
-                }
-                break;
+    constexpr uint32_t encoderReadPeriodUs   = 1000000UL / (ENCODER_READ_FREQUENCY_HZ * ARM_COUNT);
+    constexpr int      encoderLines[ARM_COUNT] = { TLEncoderLine, TREncoderLine, BLEncoderLine, BREncoderLine };
+    const uint32_t     nowUs = micros();
+    if (!readingFromSD && static_cast<uint32_t>(nowUs - lastEncoderReadUs) >= encoderReadPeriodUs) {
+        if (!axis[encoderToRead].updateEncoderPosition()) {
+            encoderFailCounter[encoderLines[encoderToRead]]++;
         }
-        encoderToRead++;
-        if (encoderToRead > 3) {
-            encoderToRead         = 0;
-            lastCallToEncoderRead = millis();
-        }
+        encoderToRead   = (encoderToRead + 1) % ARM_COUNT;
+        lastEncoderReadUs = nowUs;
     }
 
     // if more than 1% of readings fail, warn user, if more than 10% fail, stop the machine and raise alarm

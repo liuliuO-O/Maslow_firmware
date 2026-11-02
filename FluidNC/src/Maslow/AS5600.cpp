@@ -7,6 +7,7 @@
 //     URL: https://github.com/RobTillaart/AS5600
 
 #include "AS5600.h"
+#include "EncoderPosition.h"
 #include "../Report.h"
 
 //  CONFIGURATION REGISTERS
@@ -429,7 +430,7 @@ float AS5600::getAngularSpeed(uint8_t mode)
 //
 //  POSITION cumulative
 //
-int32_t AS5600::getCumulativePosition(bool update)
+int32_t AS5600::getCumulativePosition(bool update, int8_t expectedDirection)
 {
   if (update)
   {
@@ -439,23 +440,8 @@ int32_t AS5600::getCumulativePosition(bool update)
       return _position;  //  last known position.
     }
   }
-  int16_t value = _lastReadAngle;
-
-  // FLUIDNC CUSTOM MODIFICATION: Use quarter-circle thresholds (1024/3072) instead of half-circle (2048)
-  // to be more conservative about detecting full rotations and prevent accidental rotation loss
-  //A transition from the highest 1/4th to the loweset 1/4th
-  if ((value < 1024) && (_lastPosition > 3072)) {
-      _position += abs(4096 - abs(value - _lastPosition));
-  }
-  //A transition from the lowest 1/4th to the highest 1/4th
-  else if ((_lastPosition < 1024) && (value > 3072)) {
-      _position -= abs(4096 - abs(value - _lastPosition));
-  }
-  //We've just moved a bit up
-  else {
-      _position += (value - _lastPosition);
-  }
-
+  const uint16_t value = _lastReadAngle;
+  _position += MaslowEncoder::unwrapDelta(_lastPosition, value, expectedDirection);
   _lastPosition = value;
   return _position;
 }

@@ -57,6 +57,8 @@ private:
     bool     encoderDiagnosticInitialized = false;
     int32_t  encoderDiagnosticLastCounts = 0;
     unsigned long encoderDiagnosticLastTime = 0;
+    unsigned long encoderDiagnosticLastPrintTime = 0;
+    uint32_t encoderDiagnosticSuppressed = 0;
     int     _encoderAddress;
     AS5600  encoder;
     MiniPID positionPID;  //These are the P,I,D values for the servo motors

@@ -129,24 +129,38 @@ bool MotorUnit::updateEncoderPosition() {
 
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
 
-    if (encoder.isConnected()) {                                               //this func has 50ms timeout (or worse?, hard to tell)
-        const int32_t cumulativeCounts      = encoder.getCumulativePosition();  //This updates and returns the encoder value
-        mostRecentCumulativeEncoderReading = cumulativeCounts;
+    // Belt position is the inverse of encoder counts, so inward (negative PWM)
+    // normally increases counts and outward (positive PWM) decreases them.
+    // Use that known direction only for substantial drive; preserve small
+    // backlash or externally forced motion instead of inventing a revolution.
+    int8_t expectedEncoderDirection = 0;
+    if (_commandPWM <= -100) {
+        expectedEncoderDirection = 1;
+    } else if (_commandPWM >= 100) {
+        expectedEncoderDirection = -1;
+    }
 
-        // Check for I2C communication errors using new AS5600 error handling
-        int error = encoder.lastError();
-        if (error != 0) {  // AS5600_OK = 0
-            ++encoderReadFailures;
-            if (millis() - encoderReadFailurePrintTime > 5000) {
-                encoderReadFailurePrintTime = millis();
-                log_warn("Encoder I2C error " << error << " on " << encAddrLabel.c_str());
-            }
-            return false;
+    const int32_t cumulativeCounts = encoder.getCumulativePosition(true, expectedEncoderDirection);
+
+    // Check the angle transaction directly.  A separate isConnected() probe on
+    // every sample doubled I2C traffic and reduced the effective sample rate.
+    int error = encoder.lastError();
+    if (error != 0) {  // AS5600_OK = 0
+        ++encoderReadFailures;
+        if (millis() - encoderReadFailurePrintTime > 5000) {
+            encoderReadFailurePrintTime = millis();
+            log_warn("Encoder I2C error " << error << " on " << encAddrLabel.c_str());
         }
-        const unsigned long now = millis();
-        if (encoderDiagnosticInitialized) {
-            const int32_t countDelta = cumulativeCounts - encoderDiagnosticLastCounts;
-            if (abs(countDelta) > 1536) {
+        return false;
+    }
+
+    mostRecentCumulativeEncoderReading = cumulativeCounts;
+    const unsigned long now = millis();
+    if (encoderDiagnosticInitialized) {
+        const int32_t countDelta = cumulativeCounts - encoderDiagnosticLastCounts;
+        if (abs(countDelta) > 1536) {
+            ++encoderDiagnosticSuppressed;
+            if (now - encoderDiagnosticLastPrintTime >= 250) {
                 log_warn("CALDIAG encoder_step axis=" << encAddrLabel.c_str()
                          << " sensor_raw=" << encoder.getLastSensorAngle()
                          << " directed=" << encoder.getLastReadAngle()
@@ -155,20 +169,18 @@ bool MotorUnit::updateEncoderPosition() {
                          << " delta_counts=" << countDelta
                          << " cumulative_counts=" << cumulativeCounts
                          << " dt_ms=" << static_cast<unsigned int>(now - encoderDiagnosticLastTime)
-                         << " pwm=" << _commandPWM);
+                         << " pwm=" << _commandPWM
+                         << " expected_count_direction=" << static_cast<int>(expectedEncoderDirection)
+                         << " suppressed=" << encoderDiagnosticSuppressed);
+                encoderDiagnosticLastPrintTime = now;
+                encoderDiagnosticSuppressed = 0;
             }
         }
-        encoderDiagnosticInitialized = true;
-        encoderDiagnosticLastCounts  = cumulativeCounts;
-        encoderDiagnosticLastTime    = now;
-        return true;
-    } else if (millis() - encoderReadFailurePrintTime > 5000) {
-        encoderReadFailurePrintTime = millis();
-        log_warn("Encoder read failure on " << encAddrLabel.c_str());
-        //Maslow.panic();
     }
-    ++encoderReadFailures;
-    return false;
+    encoderDiagnosticInitialized = true;
+    encoderDiagnosticLastCounts  = cumulativeCounts;
+    encoderDiagnosticLastTime    = now;
+    return true;
 }
 
 /*!
