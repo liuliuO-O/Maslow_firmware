@@ -218,6 +218,8 @@ public:
   //  EXPERIMENTAL CUMULATIVE POSITION
   //  reads sensor and updates cumulative position
   int32_t  getCumulativePosition(bool update = true);
+  uint16_t getLastReadAngle() const { return _lastReadAngle; }
+  uint16_t getLastSensorAngle() const { return _lastSensorAngle; }
   //  converts last position to whole revolutions.
   int32_t  getRevolutions();
   //  resets position only (not the i)
@@ -249,6 +251,7 @@ protected:
   uint32_t _lastMeasurement = 0;
   int16_t  _lastAngle       = 0;
   int16_t  _lastReadAngle   = 0;
+  uint16_t _lastSensorAngle = 0;
 
   //  for readAngle() and rawAngle()
   uint16_t _offset          = 0;

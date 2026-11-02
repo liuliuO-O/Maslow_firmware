@@ -23,9 +23,12 @@ extern const char* VERSION_NUMBER;
 #define BLEncoderLine 3
 #define BREncoderLine 0
 
-// Temporary direction correction for the currently installed TR encoder board.
-// Set to false to restore the original encoder direction; motor direction is unchanged.
-static constexpr bool trEncoderReversed = true;
+// Temporary diagnostic mapping while the complete TL and TR motor/encoder
+// assemblies are physically swapped. Keep the software direction with the
+// assembly: the former TR assembly is now on TL, and the former TL assembly is
+// now on TR.
+static constexpr bool tlEncoderReversed = true;
+static constexpr bool trEncoderReversed = false;
 
 #define motorPWMFreq 2000
 #define motorPWMRes 10
@@ -76,7 +79,7 @@ void Maslow_::begin(void (*sys_rt)()) {
     Wire.begin(5, 4, 200000);
     I2CMux.begin(TCAADDR, Wire);
 
-    axis[_TL].begin(tlIn1Pin, tlIn2Pin, tlADCPin, TLEncoderLine, tlIn1Channel, tlIn2Channel);
+    axis[_TL].begin(tlIn1Pin, tlIn2Pin, tlADCPin, TLEncoderLine, tlIn1Channel, tlIn2Channel, tlEncoderReversed);
     axis[_TR].begin(trIn1Pin, trIn2Pin, trADCPin, TREncoderLine, trIn1Channel, trIn2Channel, trEncoderReversed);
     axis[_BL].begin(blIn1Pin, blIn2Pin, blADCPin, BLEncoderLine, blIn1Channel, blIn2Channel);
     axis[_BR].begin(brIn1Pin, brIn2Pin, brADCPin, BREncoderLine, brIn1Channel, brIn2Channel);

@@ -54,6 +54,9 @@ public:
 
 private:
     uint32_t encoderReadFailures = 0;  // Cumulative since boot, including mux selection failures.
+    bool     encoderDiagnosticInitialized = false;
+    int32_t  encoderDiagnosticLastCounts = 0;
+    unsigned long encoderDiagnosticLastTime = 0;
     int     _encoderAddress;
     AS5600  encoder;
     MiniPID positionPID;  //These are the P,I,D values for the servo motors

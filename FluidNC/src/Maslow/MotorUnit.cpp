@@ -130,7 +130,8 @@ bool MotorUnit::updateEncoderPosition() {
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
 
     if (encoder.isConnected()) {                                               //this func has 50ms timeout (or worse?, hard to tell)
-        mostRecentCumulativeEncoderReading = encoder.getCumulativePosition();  //This updates and returns the encoder value
+        const int32_t cumulativeCounts      = encoder.getCumulativePosition();  //This updates and returns the encoder value
+        mostRecentCumulativeEncoderReading = cumulativeCounts;
 
         // Check for I2C communication errors using new AS5600 error handling
         int error = encoder.lastError();
@@ -142,6 +143,24 @@ bool MotorUnit::updateEncoderPosition() {
             }
             return false;
         }
+        const unsigned long now = millis();
+        if (encoderDiagnosticInitialized) {
+            const int32_t countDelta = cumulativeCounts - encoderDiagnosticLastCounts;
+            if (abs(countDelta) > 1536) {
+                log_warn("CALDIAG encoder_step axis=" << encAddrLabel.c_str()
+                         << " sensor_raw=" << encoder.getLastSensorAngle()
+                         << " directed=" << encoder.getLastReadAngle()
+                         << " direction=" << static_cast<unsigned int>(encoder.getDirection())
+                         << " mux_expected=" << _encoderAddress
+                         << " delta_counts=" << countDelta
+                         << " cumulative_counts=" << cumulativeCounts
+                         << " dt_ms=" << static_cast<unsigned int>(now - encoderDiagnosticLastTime)
+                         << " pwm=" << _commandPWM);
+            }
+        }
+        encoderDiagnosticInitialized = true;
+        encoderDiagnosticLastCounts  = cumulativeCounts;
+        encoderDiagnosticLastTime    = now;
         return true;
     } else if (millis() - encoderReadFailurePrintTime > 5000) {
         encoderReadFailurePrintTime = millis();
@@ -397,6 +416,7 @@ void MotorUnit::zero() {
     encoder.resetCumulativePosition();
     // Update our cached value to match the reset position
     mostRecentCumulativeEncoderReading = 0;
+    encoderDiagnosticInitialized       = false;
 }
 
 //sets the encoder position to a specific value (for restoring from NVS)
@@ -410,6 +430,7 @@ void MotorUnit::setPosition(double position) {
 
     // Update our cached value
     mostRecentCumulativeEncoderReading = encoderCounts;
+    encoderDiagnosticInitialized = false;
 }
 
 //Gets the current raw encoder angle (0-4095)

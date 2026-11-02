@@ -1610,25 +1610,25 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
     else if (orientation == HORIZONTAL) {
         // For the first six waypoints (waypoints 0-5), use sequential pulling to handle slack belts properly
         if (waypoint <= 5) {
-            static bool tight[ARM_COUNT]         = { false, false, false, false };
-            static bool initial_tension_complete = false;
+            bool* tight                     = horizontalTight;
+            bool& initial_tension_complete = horizontalInitialTensionComplete;
 
             // Phase 1: Pull all four belts tight simultaneously to eliminate slack
             if (!initial_tension_complete) {
                 diagnosticStage("horizontal_initial_tighten");
-                // pull_tight() stops and resets its ramp on success. Calling it
-                // again would restart a completed motor while other axes finish.
-                // These flags record completion, not a guarantee of retained tension.
-                if (!tight[_TL] && Maslow.axis[_TL].pull_tight(current)) {
+                // Keep calling completed axes while the other axes finish. stop()
+                // is high impedance on this hardware, so leaving a completed axis
+                // idle allows the remaining axes to drag the machine across the frame.
+                if (Maslow.axis[_TL].pull_tight(current)) {
                     tight[_TL] = true;
                 }
-                if (!tight[_TR] && Maslow.axis[_TR].pull_tight(current)) {
+                if (Maslow.axis[_TR].pull_tight(current)) {
                     tight[_TR] = true;
                 }
-                if (!tight[_BL] && Maslow.axis[_BL].pull_tight(current)) {
+                if (Maslow.axis[_BL].pull_tight(current)) {
                     tight[_BL] = true;
                 }
-                if (!tight[_BR] && Maslow.axis[_BR].pull_tight(current)) {
+                if (Maslow.axis[_BR].pull_tight(current)) {
                     tight[_BR] = true;
                 }
 
@@ -1659,6 +1659,30 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
             // This ensures TL and TR remain as stable reference points for position calculation
             Maslow.axis[_TL].recomputePID();
             Maslow.axis[_TR].recomputePID();
+
+            const bool tlConflict = abs(Maslow.axis[_TL].getTarget() - Maslow.axis[_TL].getPosition()) > 25.0
+                                 && abs(Maslow.axis[_TL].getMotorPower()) >= 1000.0;
+            const bool trConflict = abs(Maslow.axis[_TR].getTarget() - Maslow.axis[_TR].getPosition()) > 25.0
+                                 && abs(Maslow.axis[_TR].getMotorPower()) >= 1000.0;
+            if (tlConflict || trConflict) {
+                if (horizontalHoldConflictStart == 0) {
+                    horizontalHoldConflictStart = millis();
+                } else if (millis() - horizontalHoldConflictStart >= 1500) {
+                    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+                        Maslow.axis[arm].stop();
+                    }
+                    log_error("Horizontal measurement stopped: a top hold axis remained over 25mm from target at maximum PWM. "
+                              << "TL target=" << Maslow.axis[_TL].getTarget() << " actual=" << Maslow.axis[_TL].getPosition()
+                              << " TR target=" << Maslow.axis[_TR].getTarget() << " actual=" << Maslow.axis[_TR].getPosition());
+                    for (int arm = _TL; arm < ARM_COUNT; ++arm) horizontalTight[arm] = false;
+                    horizontalInitialTensionComplete = false;
+                    horizontalHoldConflictStart = 0;
+                    horizontalMeasurementFault = true;
+                    return false;
+                }
+            } else {
+                horizontalHoldConflictStart = 0;
+            }
 
             // Pull bottom belts based on x-coordinate (same logic as vertical mode)
             if (Maslow.x < 0) {
@@ -1712,6 +1736,9 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
                 result[1] = measurementToXYPlane(Maslow.axis[_TR].getPosition(), trTotalZ);
                 result[2] = measurementToXYPlane(Maslow.axis[_BL].getPosition(), blTotalZ);
                 result[3] = measurementToXYPlane(Maslow.axis[_BR].getPosition(), brTotalZ);
+                log_info("CALDIAG measurement wp=" << waypoint << " run=" << run
+                         << " TL=" << result[_TL] << " TR=" << result[_TR]
+                         << " BL=" << result[_BL] << " BR=" << result[_BR]);
                 // Reset all flags for next measurement
                 tight[_TL]               = false;
                 tight[_TR]               = false;
@@ -1806,6 +1833,9 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
                 result[1]   = measurementToXYPlane(Maslow.axis[_TR].getPosition(), trTotalZ);
                 result[2]   = measurementToXYPlane(Maslow.axis[_BL].getPosition(), blTotalZ);
                 result[3]   = measurementToXYPlane(Maslow.axis[_BR].getPosition(), brTotalZ);
+                log_info("CALDIAG measurement wp=" << waypoint << " run=" << run
+                         << " TL=" << result[_TL] << " TR=" << result[_TR]
+                         << " BL=" << result[_BL] << " BR=" << result[_BR]);
                 pull1_tight = false;
                 pull2_tight = false;
                 return true;
@@ -1841,6 +1871,7 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
     static float avg         = 0;
     static float sum         = 0;
     static bool  measureFlex = false;
+    static int   criticalCounter = 0;
 
     if (measurements == nullptr) {
         allocateMeasurements();  //This is structured [[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]]
@@ -1851,7 +1882,17 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
         howHardToPull = retractCurrentThreshold + 500;
     }
 
-    if (take_measurement(measurements[max(run - 2, 0)], dir, run, howHardToPull, waypoint)) {  //Throw away measurements are stored in [0]
+    const bool measurementTaken = take_measurement(measurements[max(run - 2, 0)], dir, run, howHardToPull, waypoint);
+    if (horizontalMeasurementFault) {
+        run = 0;
+        criticalCounter = 0;
+        horizontalMeasurementFault = false;
+        if (measurements != nullptr) freeMeasurements();
+        resetCalibrationState();
+        requestStateChange(EXTENDEDOUT);
+        return false;
+    }
+    if (measurementTaken) {  //Throw away measurements are stored in [0]
         if (run < 2) {
             run++;
             return false;  //discard the first two measurements
@@ -1859,7 +1900,6 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
 
         run++;
 
-        static int criticalCounter = 0;
         if (run > 5) {
             run = 0;
 
@@ -2504,6 +2544,10 @@ void Calibration::deallocateCalibrationMemory() {
 void Calibration::resetCalibrationState() {
     diagnosticPhase = nullptr;
     diagnosticWaypoint = -1;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) horizontalTight[arm] = false;
+    horizontalInitialTensionComplete = false;
+    horizontalMeasurementFault = false;
+    horizontalHoldConflictStart = 0;
     // Reset calibration progress variables
     waypoint               = 0;
     pointCount             = 0;

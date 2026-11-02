@@ -305,13 +305,14 @@ uint16_t AS5600::rawAngle()
 uint16_t AS5600::readAngle()
 {
   uint16_t value = readReg2(AS5600_ANGLE) & 0x0FFF;
-  _lastReadAngle = value;
+  _lastSensorAngle = value;
   if (_offset > 0) value = (value + _offset) & 0x0FFF;
 
   if ((_directionPin == AS5600_SW_DIRECTION_PIN) && (_direction == AS5600_COUNTERCLOCK_WISE))
   {
     value = (4096 - value) & 0x0FFF;
   }
+  _lastReadAngle = value;
   return value;
 }
 

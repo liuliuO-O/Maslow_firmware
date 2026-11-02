@@ -7,7 +7,7 @@ import unittest
 
 
 class HorizontalTighteningTest(unittest.TestCase):
-    def test_completed_axes_do_not_restart_and_bottom_outputs_are_cleared(self):
+    def test_completed_axes_keep_tension_and_bottom_outputs_are_cleared(self):
         source = (Path(__file__).resolve().parents[2] / 'src/Maslow/Calibration.cpp').read_text()
         start = source.index('            if (!initial_tension_complete) {')
         end = source.index('\n            diagnosticTightMask =', start)
@@ -51,8 +51,8 @@ int main() {
             assert(!step(1000));
             for (int i=0;i<4;++i) {
                 auto& axis=Maslow.axis[i];
-                assert(axis.calls == std::min(tick+1, axis.finish+1));
-                if (axis.finish <= tick) assert(axis.pwm == 0);
+                assert(axis.calls == tick+1);
+                if (axis.finish < tick && tick < 3) assert(axis.pwm == -500);
             }
             assert(initial_tension_complete == (tick==3));
         }
@@ -61,7 +61,7 @@ int main() {
         assert(Maslow.axis[_TL].target==42 && Maslow.axis[_TR].target==42);
         assert(Maslow.axis[_BL].target==-1 && Maslow.axis[_BR].target==-1);
         assert(step(1000)); // Initial phase no longer issues commands.
-        for(int i=0;i<4;++i) assert(Maslow.axis[i].calls==Maslow.axis[i].finish+1);
+        for(int i=0;i<4;++i) assert(Maslow.axis[i].calls==4);
     } while(std::next_permutation(order.begin(),order.end()));
 }
 '''.replace('BLOCK', block)

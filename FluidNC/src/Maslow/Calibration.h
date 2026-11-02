@@ -103,6 +103,10 @@ private:
     int diagnosticCurrentThreshold = 0;
     unsigned diagnosticTightMask = 0;
     uint32_t diagnosticEncoderBaseline[ARM_COUNT] = {};
+    bool horizontalTight[ARM_COUNT] = { false, false, false, false };
+    bool horizontalInitialTensionComplete = false;
+    bool horizontalMeasurementFault = false;
+    unsigned long horizontalHoldConflictStart = 0;
     //Variables used for retracting state
     bool axis_homed[4]         = { false, false, false, false };
     bool retracting[ARM_COUNT] = { false, false, false, false };
