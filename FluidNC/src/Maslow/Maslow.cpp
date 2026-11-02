@@ -23,12 +23,11 @@ extern const char* VERSION_NUMBER;
 #define BLEncoderLine 3
 #define BREncoderLine 0
 
-// Temporary diagnostic mapping while the complete TL and TR motor/encoder
-// assemblies are physically swapped. Keep the software direction with the
-// assembly: the former TR assembly is now on TL, and the former TL assembly is
-// now on TR.
-static constexpr bool tlEncoderReversed = true;
-static constexpr bool trEncoderReversed = false;
+// Normal physical mapping: TL/TR motor and encoder plugs are connected to their
+// matching mainboard ports.  Only the TR encoder requires software reversal;
+// motor direction is unchanged.
+static constexpr bool tlEncoderReversed = false;
+static constexpr bool trEncoderReversed = true;
 
 #define motorPWMFreq 2000
 #define motorPWMRes 10
