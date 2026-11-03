@@ -24,10 +24,11 @@ extern const char* VERSION_NUMBER;
 #define BREncoderLine 0
 
 // Normal physical mapping: TL/TR motor and encoder plugs are connected to their
-// matching mainboard ports.  Only the TR encoder requires software reversal;
-// motor direction is unchanged.
+// matching mainboard ports. Toggle an encoder flag below to reverse its readings
+// without changing motor direction. Only BR currently needs software reversal.
 static constexpr bool tlEncoderReversed = false;
-static constexpr bool trEncoderReversed = true;
+static constexpr bool trEncoderReversed = false;
+static constexpr bool brEncoderReversed = true;
 
 #define motorPWMFreq 2000
 #define motorPWMRes 10
@@ -83,7 +84,7 @@ void Maslow_::begin(void (*sys_rt)()) {
     axis[_TL].begin(tlIn1Pin, tlIn2Pin, tlADCPin, TLEncoderLine, tlIn1Channel, tlIn2Channel, tlEncoderReversed);
     axis[_TR].begin(trIn1Pin, trIn2Pin, trADCPin, TREncoderLine, trIn1Channel, trIn2Channel, trEncoderReversed);
     axis[_BL].begin(blIn1Pin, blIn2Pin, blADCPin, BLEncoderLine, blIn1Channel, blIn2Channel);
-    axis[_BR].begin(brIn1Pin, brIn2Pin, brADCPin, BREncoderLine, brIn1Channel, brIn2Channel);
+    axis[_BR].begin(brIn1Pin, brIn2Pin, brADCPin, BREncoderLine, brIn1Channel, brIn2Channel, brEncoderReversed);
 
     calibration.axisHomed[_BL] = false;
     calibration.axisHomed[_BR] = false;
