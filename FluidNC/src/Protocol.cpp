@@ -11,6 +11,7 @@
 #include "Event.h"
 
 #include <atomic>
+#include <freertos/semphr.h>
 
 #include "Machine/MachineConfig.h"
 #include "Machine/Homing.h"
@@ -118,9 +119,17 @@ struct LogMessage {
 };
 
 void drain_messages() {
-    while (uxQueueMessagesWaiting(message_queue)) {
-        vTaskDelay(1);  // Let the output task finish sending data
+    if (!outputTask || xTaskGetCurrentTaskHandle() == outputTask) {
+        return;
     }
+    // An empty queue may still have a println() in flight on the other core.
+    // A FIFO fence is acknowledged only after every earlier write has returned.
+    StaticSemaphore_t storage;
+    SemaphoreHandle_t done = xSemaphoreCreateBinaryStatic(&storage);
+    LogMessage fence { nullptr, done, false };
+    while (!xQueueSend(message_queue, &fence, portMAX_DELAY)) {}
+    xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
 }
 
 // This overload is used primarily with fixed string
@@ -178,7 +187,9 @@ void output_loop(void* unused) {
     while (true) {
         LogMessage message;
         if (xQueueReceive(message_queue, &message, 0)) {
-            if (message.isString) {
+            if (!message.channel) {
+                xSemaphoreGive(static_cast<SemaphoreHandle_t>(message.line));
+            } else if (message.isString) {
                 std::string* s = static_cast<std::string*>(message.line);
                 message.channel->println(s->c_str());
                 delete s;
@@ -191,7 +202,7 @@ void output_loop(void* unused) {
     }
 }
 
-Channel* activeChannel = nullptr;  // Channel associated with the input line
+std::atomic<Channel*> activeChannel { nullptr };  // Owns the input channel through execute_line() and ack().
 
 TaskHandle_t telemetryTask = nullptr;
 
@@ -229,7 +240,7 @@ void polling_loop(void* unused) {
             vTaskDelay(100);
             continue;
         }
-        if (activeChannel) {
+        if (activeChannel.load(std::memory_order_acquire)) {
             // Poll for realtime characters when waiting for the primary loop
             // (in another thread) to pick up the line.
             pollChannels();
@@ -238,7 +249,7 @@ void polling_loop(void* unused) {
 
         // Polling without an argument both checks for realtime characters and
         // returns a line-oriented command if one is ready.
-        activeChannel = pollChannels(activeLine);
+        activeChannel.store(pollChannels(activeLine), std::memory_order_release);
     }
 }
 
@@ -320,20 +331,21 @@ void     protocol_main_loop() {
     // This is also where the system idles while waiting for something to do.
     // ---------------------------------------------------------------------------------
     for (;; vTaskDelay(0)) {
-        if (activeChannel) {
+        Channel* channel = activeChannel.load(std::memory_order_acquire);
+        if (channel) {
             // The input polling task has collected a line of input
 #ifdef DEBUG_REPORT_ECHO_RAW_LINE_RECEIVED
             report_echo_line_received(activeLine, allChannels);
 #endif
 
-            Error status_code = execute_line(activeLine, *activeChannel, WebUI::AuthenticationLevel::LEVEL_GUEST);
+            Error status_code = execute_line(activeLine, *channel, WebUI::AuthenticationLevel::LEVEL_GUEST);
 
             // Tell the channel that the line has been processed.
-            activeChannel->ack(status_code);
+            channel->ack(status_code);
 
             // Tell the input polling task that the line has been processed,
             // so it can give us another one when available
-            activeChannel = nullptr;
+            activeChannel.store(nullptr, std::memory_order_release);
         }
 
         protocol_execute_realtime();  // Runtime command check point.
@@ -813,6 +825,11 @@ void protocol_do_cycle_stop() {
     protocol_disable_steppers();
 
     switch (sys.state()) {
+        case State::ConfigAlarm:
+        case State::Alarm:
+            // A queued cycle-stop can arrive after an emergency abort or even
+            // after the protocol reset. Completion must never clear that alarm.
+            break;
         case State::Hold:
         case State::SafetyDoor:
         case State::Sleep:
@@ -835,8 +852,6 @@ void protocol_do_cycle_stop() {
                 break;
             }
             // Fall through
-        case State::ConfigAlarm:
-        case State::Alarm:
         case State::CheckMode:
         case State::Idle:
         case State::Cycle:

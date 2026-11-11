@@ -1,3 +1,5 @@
+import os
+from test_calibration_bootstrap import compiler_command
 """Exercise the production horizontal initial-tightening block with staged completions."""
 from pathlib import Path
 import shutil
@@ -8,7 +10,7 @@ import unittest
 
 class HorizontalTighteningTest(unittest.TestCase):
     def test_completed_axes_keep_tension_and_bottom_outputs_are_cleared(self):
-        source = (Path(__file__).resolve().parents[2] / 'src/Maslow/Calibration.cpp').read_text()
+        source = (Path(__file__).resolve().parents[2] / 'src/Maslow/Calibration.cpp').read_text(encoding='utf-8-sig')
         start = source.index('            if (!initial_tension_complete) {')
         end = source.index('\n            diagnosticTightMask =', start)
         block = source[start:end]
@@ -67,9 +69,9 @@ int main() {
 '''.replace('BLOCK', block)
         with tempfile.TemporaryDirectory() as directory:
             cpp = Path(directory) / 'test.cpp'
-            binary = Path(directory) / 'test'
-            cpp.write_text(harness)
-            subprocess.run([shutil.which('c++') or 'c++', '-std=c++11', str(cpp), '-o', str(binary)], check=True)
+            binary = Path(directory) / ('test.exe' if os.name == 'nt' else 'test')
+            cpp.write_text(harness, encoding='utf-8')
+            subprocess.run(compiler_command(Path(__file__).resolve().parents[3]) + ['-std=c++11', str(cpp), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)
 
 

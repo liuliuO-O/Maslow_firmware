@@ -909,13 +909,15 @@ static Error maslow_start_calibration(const char* value, WebUI::AuthenticationLe
     if (Maslow.using_default_config) {
         return Error::ConfigurationInvalid;
     }
-    sys.set_state(State::Homing);
+    if (Maslow.error) {
+        log_error("Cannot start Find Anchors: resolve motor/encoder initialization errors first");
+        return Error::ConfigurationInvalid;
+    }
     // requestStateChange(CALIBRATION_IN_PROGRESS) performs significant initialization work
     // (memory allocation, grid generation, position computation). Reset the update watchdog
     // before calling it to prevent a false emergency stop.
     Maslow.resetUpdateWatchdog();
-    Maslow.calibration.requestStateChange(CALIBRATION_IN_PROGRESS);
-    return Error::Ok;
+    return Maslow.calibration.requestStateChange(CALIBRATION_IN_PROGRESS) ? Error::Ok : Error::IdleError;
 }
 
 static Error overwrite_config(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
@@ -1022,9 +1024,7 @@ static Error maslow_takeSlack(const char* value, WebUI::AuthenticationLevel auth
     if (Maslow.using_default_config) {
         return Error::ConfigurationInvalid;
     }
-    sys.set_state(State::Homing);
-    Maslow.calibration.requestStateChange(TAKING_SLACK);
-    return Error::Ok;
+    return Maslow.calibration.requestStateChange(TAKING_SLACK) ? Error::Ok : Error::IdleError;
 }
 
 static Error maslow_reset_calibration(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
@@ -1037,7 +1037,7 @@ static Error maslow_reset_calibration(const char* value, WebUI::AuthenticationLe
 }
 
 static Error maslow_estop(const char* value, WebUI::AuthenticationLevel auth_level, Channel& out) {
-    sys.set_state(State::Alarm);
+    // eStop must see Cycle/Jog/Homing before it latches Alarm and aborts motion.
     Maslow.eStop();
     return Error::Ok;
 }

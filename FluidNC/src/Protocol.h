@@ -6,6 +6,10 @@
 #pragma once
 
 #include "Types.h"
+#include <atomic>
+
+class Channel;
+extern std::atomic<Channel*> activeChannel;
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>

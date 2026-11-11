@@ -1,3 +1,5 @@
+import os
+from test_calibration_bootstrap import compiler_command
 import subprocess
 import tempfile
 import textwrap
@@ -28,10 +30,10 @@ class EncoderPositionTest(unittest.TestCase):
         ''')
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / 'test.cpp'
-            exe = Path(tmp) / 'test'
+            exe = Path(tmp) / ('test.exe' if os.name == 'nt' else 'test')
             src.write_text(source)
-            subprocess.run([
-                'c++', '-std=c++17', '-I', str(root / 'src' / 'Maslow'), str(src), '-o', str(exe)
+            subprocess.run(compiler_command(Path(__file__).resolve().parents[3]) + [
+                '-std=c++17', '-I', str(root / 'src' / 'Maslow'), str(src), '-o', str(exe)
             ], check=True)
             subprocess.run([str(exe)], check=True)
 

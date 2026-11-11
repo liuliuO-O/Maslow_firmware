@@ -1,4 +1,6 @@
 #include "Calibration.h"
+#include "CalibrationSampleWindow.h"
+#include "SavedAnchorRecovery.h"
 #include "Maslow.h"
 #include "../Kinematics/MaslowKinematics.h"
 #include "../Serial.h"
@@ -7,6 +9,14 @@
 #include "SquareCalculation.h"
 #include <esp_task_wdt.h>
 #include <algorithm>
+
+// Bootstrap17 (first-anchor) profile tolerance.  The sled creeps a few mm during
+// each tighten/measure cycle on the real frame, so the precision limit cannot be
+// met until the anchors exist.  Keep the value in one place so the startup log
+// and the measurement check cannot drift apart.
+static constexpr float BOOTSTRAP17_REPEATABILITY_MM  = 15.0f;
+static constexpr float BOOTSTRAP17_RMS_LIMIT_MM      = 10.0f;
+static constexpr float BOOTSTRAP17_MAX_RESIDUAL_MM   = 30.0f;
 #include <cmath>
 #include <new>
 #include <cstdio>
@@ -397,35 +407,27 @@ bool Calibration::requestStateChange(int newState) {
             } else {
                 break;
             }
-        case TAKING_SLACK:  //We can enter taking slack from extended or ready to cut
-            if (currentState == EXTENDEDOUT || currentState == READY_TO_CUT) {
-                currentState = TAKING_SLACK;
-
-                //Reset the axis targets at the beginning of taking slack
-                Maslow.axis[_TL].setTarget(Maslow.axis[_TL].getPosition());
-                Maslow.axis[_TR].setTarget(Maslow.axis[_TR].getPosition());
-
-                retracting[_TL] = false;  //Should be replaced by state now
-                retracting[_TR] = false;
-                retracting[_BL] = false;
-                retracting[_BR] = false;
-
-                for (int arm = _TL; arm < ARM_COUNT; arm++) {
-                    Maslow.axis[arm].reset();
-                }
-
-                Maslow.x  = 0;
-                Maslow.y  = 0;
-                takeSlack = true;
-
-                //Alocate the memory to store the measurements in. This is used here because take slack will use the same memory as the calibration
-                allocateCalibrationMemory();
+        case TAKING_SLACK:
+            if (keepSettledSavedAnchorHold()) {
                 success = true;
                 break;
-            } else {
-                log_info("Cannot take slack until the belts have been extended");
+            }
+            if (currentState == READY_TO_CUT && savedAnchorHoldActive && applyTensionRecovery.motionSettling) {
+                log_info("Apply Tension requires the current motion to settle");
                 break;
             }
+            // Idle is also required when retrying a previously aborted restore.
+            if (sys.state() == State::Idle &&
+                (currentState == EXTENDEDOUT || currentState == READY_TO_CUT || currentState == TAKING_SLACK) &&
+                beginApplyTension()) {
+                currentState = TAKING_SLACK;
+                sys.set_state(State::Homing);
+                takeSlack = true;
+                success = true;
+            } else {
+                log_info("Apply Tension requires Idle, extended belts and a valid belt reference");
+            }
+            break;
         case CALIBRATION_IN_PROGRESS:  //We can enter calibration in progress from EXTENDEDOUT, READY_TO_CUT, or CALIBRATION_COMPUTING
             if (currentState == EXTENDEDOUT || currentState == READY_TO_CUT || currentState == CALIBRATION_COMPUTING) {
                 // If we're coming from CALIBRATION_COMPUTING and calibration is already complete,
@@ -466,20 +468,27 @@ bool Calibration::requestStateChange(int newState) {
 
                 //If we are at the first point we need to generate the grid before we can start
                 if (waypoint == 0) {
+                    resetMeasurementState();
                     // Initialize calibration loop state for fresh start
                     calibrationDirection     = UP;
                     measurementInProgress    = true;
                     orientationDetectionDone = false;  // Reset orientation detection flag for new calibration
                     orientationDetectTimer   = 0;      // Reset timer so detection starts fresh
 
-                    if (!generate_calibration_grid()) {  //Fail out if the grid cannot be generated
+                    if (!generate_calibration_grid()) {
+                        log_error("Find Anchors start failed: invalid calibration grid/range");
+                        resetCalibrationState();
+                        requestStateChange(EXTENDEDOUT);
                         return false;
                     }
                 }
                 //We have just finished the first six points and have updated anchor locations so it's time to generate the grid again
                 //if the user has selected for it to be generated automatically
                 if (waypoint == 6 && calibration_grid_width_mm_X == 0 && calibration_grid_height_mm_Y == 0) {
-                    if (!generate_calibration_grid()) {  //Fail out if the grid cannot be generated
+                    if (!generate_calibration_grid()) {
+                        log_error("Find Anchors start failed: invalid calibration grid/range");
+                        resetCalibrationState();
+                        requestStateChange(EXTENDEDOUT);
                         return false;
                     }
                 }
@@ -811,11 +820,14 @@ void Calibration::home() {
 //------------------------------------------------------
 
 bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
+    lastRecomputePassed = false;
+    const double rmsLimit = calibrationBootstrap17 ? 10.0 : FITNESS_RMS_FAIL_MM;
+    const double maxResidualLimit = calibrationBootstrap17 ? 30.0 : FITNESS_MAX_RES_FAIL_MM;
     try {
         serviceCalibrationWatchdogs(true);
 
-        if (measurementCount <= 0) {
-            log_error("Find Anchors recompute failed: no measurements available");
+        if (measurementCount < 3 || measurementCount > CALIBRATION_GRID_SIZE_MAX || calibration_data == nullptr) {
+            log_error("Find Anchors recompute failed: invalid measurement count/storage");
             return false;
         }
 
@@ -828,6 +840,12 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
         std::vector<CalibrationMeasurement> measurements;
         measurements.reserve(measurementCount);
         for (int i = 0; i < measurementCount; i++) {
+            for (int arm = 0; arm < ARM_COUNT; ++arm) {
+                if (!std::isfinite(calibration_data[i][arm]) || calibration_data[i][arm] <= 0) {
+                    log_error("Find Anchors recompute failed: invalid measurement " << i << " arm=" << arm);
+                    return false;
+                }
+            }
             measurements.push_back({ calibration_data[i][0], calibration_data[i][1], calibration_data[i][2], calibration_data[i][3] });
         }
 
@@ -890,6 +908,10 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
             std::vector<double> residuals;
             bundleResiduals(measurements, params, residuals);
             double currentSSR = sumSquaredResiduals(residuals);
+            if (!std::isfinite(currentSSR)) {
+                log_error("Find Anchors recompute failed: non-finite initial geometry");
+                return false;
+            }
 
             std::vector<double> bestParams = params;
             double              bestSSR    = currentSSR;
@@ -898,6 +920,7 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
             std::vector<double> nextParams;
             std::vector<double> nextResiduals;
             int                 iterationCount = 0;
+            bool attemptConverged = false;
 
         for (int iteration = 0; iteration < LM_MAX_ITERATIONS; iteration++) {
             iterationCount = iteration + 1;
@@ -911,6 +934,7 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
             double ga[5]        = {};
             double schurSub[5][5] = {};
             double schurGain[5] = {};
+            double pointGradientMax = 0.0;
 
             for (size_t i = 0; i < measurements.size(); i++) {
                 const size_t sxIndex = 5 + 2 * i;
@@ -921,6 +945,7 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
                 double v00 = 0.0, v01 = 0.0, v11 = 0.0;
                 accumulatePointBlocks(
                     measurements[i], tlX, tlY, trX, trY, brX, params[sxIndex], params[syIndex], u, ga, w, gi, v00, v01, v11);
+                pointGradientMax = std::max(pointGradientMax, std::max(std::abs(gi[0]), std::abs(gi[1])));
 
                 double invV[2][2];
                 if (!invertDamped2x2(v00, v01, v11, lambda, invV)) {
@@ -936,6 +961,15 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
                         schurSub[a][b] += winv0 * w[b][0] + winv1 * w[b][1];
                     }
                 }
+            }
+
+            double gradientMax = pointGradientMax;
+            for (const double g : ga) gradientMax = std::max(gradientMax, std::abs(g) / measurementCount);
+            // Exact solutions/numerical optima need not produce a strictly lower SSR.
+            // Test the undamped gradient, so a huge lambda cannot fake convergence.
+            if (gradientMax < LM_CONVERGENCE_THRESHOLD) {
+                attemptConverged = true;
+                break;
             }
 
             for (size_t a = 0; a < 5; a++) {
@@ -1016,7 +1050,12 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
             bundleResiduals(measurements, nextParams, nextResiduals);
             const double nextSSR = sumSquaredResiduals(nextResiduals);
 
-            if (nextSSR < currentSSR) {
+            double stepNormSquared = 0.0;
+            for (size_t i = 0; i < params.size(); ++i) {
+                const double step = nextParams[i] - params[i];
+                stepNormSquared += step * step;
+            }
+            if (std::isfinite(nextSSR) && nextSSR < currentSSR) {
                 params = std::move(nextParams);
                 residuals = std::move(nextResiduals);
                 currentSSR = nextSSR;
@@ -1028,11 +1067,8 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
                     bestParams = params;
                 }
 
-                double anchorStepNorm = 0.0;
-                for (int i = 0; i < 5; i++) {
-                    anchorStepNorm += anchorStep[i] * anchorStep[i];
-                }
-                if (std::sqrt(anchorStepNorm) < LM_CONVERGENCE_THRESHOLD) {
+                if (std::sqrt(stepNormSquared) < LM_CONVERGENCE_THRESHOLD && lambda <= LM_INITIAL_LAMBDA) {
+                    attemptConverged = true;
                     break;
                 }
             } else {
@@ -1044,11 +1080,11 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
             }
             // end of LM loop
             }
-            const bool thisConverged = (rejections <= LM_MAX_REJECTIONS) && (lambda < LM_LAMBDA_OVERFLOW);
+            const bool thisConverged = attemptConverged;
             log_debug("Find Anchors LM attempt=" << attempt << " iterations=" << iterationCount
                                                  << " bestSSR=" << bestSSR << " converged=" << thisConverged);
 
-            if (bestSSR < globalBestSSR) {
+            if (thisConverged || bestSSR < globalBestSSR) {
                 globalBestSSR    = bestSSR;
                 globalBestParams = bestParams;
             }
@@ -1062,6 +1098,18 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
         serviceCalibrationWatchdogs(true);
 
         // ── Fitness computation ────────────────────────────────────────────────
+        if (globalBestParams.size() != static_cast<size_t>(5 + 2 * measurementCount) || !std::isfinite(globalBestSSR)) {
+            log_error("Find Anchors recompute failed: no finite solution");
+            return false;
+        }
+        for (const double p : globalBestParams) {
+            if (!std::isfinite(p)) return false;
+        }
+        if (globalBestParams[1] <= 0 || globalBestParams[3] <= 0 || globalBestParams[4] <= 0 ||
+            globalBestParams[2] <= globalBestParams[0]) {
+            log_error("Find Anchors recompute failed: invalid anchor ordering");
+            return false;
+        }
         std::vector<double> finalRes;
         bundleResiduals(measurements, globalBestParams, finalRes);
 
@@ -1095,13 +1143,13 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
         }
 
         // Gate 2: overall RMS
-        if (fit.rms > FITNESS_RMS_FAIL_MM) {
-            log_error("Find Anchors fit failed: rms=" << fit.rms << "mm exceeds limit " << FITNESS_RMS_FAIL_MM << "mm");
+        if (!std::isfinite(fit.rms) || fit.rms > rmsLimit) {
+            log_error("Find Anchors fit failed: rms=" << fit.rms << "mm exceeds limit " << rmsLimit << "mm");
             return false;
         }
 
         // Gate 3: max residual — find worst anchor/measurement index for the log
-        if (fit.maxResidual > FITNESS_MAX_RES_FAIL_MM) {
+        if (fit.maxResidual > maxResidualLimit) {
             int    worstI = 0, worstJ = 0;
             double worstVal = 0.0;
             for (int i = 0; i < measurementCount; i++) {
@@ -1115,20 +1163,33 @@ bool Calibration::recomputeAnchorsWithLevenbergMarquardt(int measurementCount) {
                 }
             }
             log_error("Find Anchors fit failed: maxResidual=" << fit.maxResidual << "mm at anchor=" << worstJ
-                                                              << " measurement=" << worstI << " (limit " << FITNESS_MAX_RES_FAIL_MM << "mm)");
+                                                              << " measurement=" << worstI << " (limit " << maxResidualLimit << "mm)");
             return false;
         }
 
-        // ── All gates passed: log fitness and persist ─────────────────────────
+        // ── All residual gates passed ─────────────────────────────────────────
         log_info("Find Anchors fit: rms=" << fit.rms << "mm max=" << fit.maxResidual << "mm"
                                           << " perAnchor=[" << fit.rmsPerAnchor[0] << "," << fit.rmsPerAnchor[1] << ","
                                           << fit.rmsPerAnchor[2] << "," << fit.rmsPerAnchor[3] << "]mm"
                                           << " converged=" << fit.converged);
 
-        previousFitnessRms  = fit.rms;
-        lastRecomputePassed = true;
-
         kinematics->setCalibrationAnchors(globalBestParams[0], globalBestParams[1], globalBestParams[2], globalBestParams[3], globalBestParams[4]);
+        if (!std::isfinite(kinematics->getCenterX()) || !std::isfinite(kinematics->getCenterY())) {
+            kinematics->setCalibrationAnchors(tlX0, tlY0, trX0, trY0, brX0);
+            log_error("Find Anchors fit rejected: non-finite frame center; previous anchors restored");
+            return false;
+        }
+        previousFitnessRms = fit.rms;
+        lastRecomputePassed = true;
+        // The fitted last sled point is expressed in anchor coordinates. Rebase it
+        // to the NEW center before the next move; the previous grid point used the old geometry.
+        const int last = measurementCount - 1;
+        Maslow.x = globalBestParams[5 + 2 * last] - kinematics->getCenterX();
+        Maslow.y = globalBestParams[6 + 2 * last] - kinematics->getCenterY();
+        if (calibrationGrid != nullptr) {
+            calibrationGrid[last][0] = Maslow.x;
+            calibrationGrid[last][1] = Maslow.y;
+        }
         log_info("Find Anchors recompute complete: tl=(" << globalBestParams[0] << "," << globalBestParams[1] << ") tr=(" << globalBestParams[2] << ","
                                                         << globalBestParams[3] << ") brX=" << globalBestParams[4]
                                                         << " SSR=" << globalBestSSR << " points=" << measurementCount);
@@ -1230,12 +1291,18 @@ void Calibration::calibration_loop() {
         if (lastRecomputePassed) {
             if (!updateExtendDistanceFromAnchors()) {
                 log_error("Find Anchors completed, but failed to update " << M << "_Extend_Dist");
+                resetCalibrationState();
+                requestStateChange(EXTENDEDOUT);
+                return;
             }
 
             char saveCommand[] = "$CO";
             Error saveResult   = execute_line(saveCommand, allChannels, WebUI::AuthenticationLevel::LEVEL_ADMIN);
             if (saveResult != Error::Ok) {
                 log_error("Find Anchors completed, but saving configuration failed: " << static_cast<int>(saveResult));
+                resetCalibrationState();
+                requestStateChange(EXTENDEDOUT);
+                return;
             }
 
             //Reset all of the calibration variables to the defaults so that calibration can be run again
@@ -1297,164 +1364,340 @@ void Calibration::calibration_loop() {
     }
 }
 
-/*
-* This function is used to take up the slack in the belts and confirm that the calibration values are resonable
-* It is run when the "Apply Tension" button is pressed in the UI
-* It does this by retracting the two lower belts and taking a measurement. The machine's position is then calculated 
-* from the lenghts of the two upper belts. The lengths of the two lower belts are then compared to their expected calculated lengths
-* If the difference is beyond a threshold we know that the stored anchor point locations do not match the real dimensons and and error is thrown
-* Returns true when it is finished regardless of result. Otherwise returns false. 
-*/
+// Restore a pose using saved anchors. No anchor fitting or configuration write occurs here.
+bool Calibration::beginApplyTension() {
+    const auto kinematics = getKinematics();
+    if (!all_axis_homed() || !allAxisExtended() || !kinematics || retractCurrentThreshold <= 0
+        || !std::isfinite(applyTensionMaxResidualMm)
+        || applyTensionMaxResidualMm < 0.5f || applyTensionMaxResidualMm > 5.0f) return false;
+
+    const uint32_t now = static_cast<uint32_t>(millis());
+    ApplyTensionRecoveryState next;
+    next.active = true;
+    next.started = next.lastDiagnostic = next.lastPreloadUpdate = now;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        const double length = axis.getPosition();
+        if (!axis.hasFreshEncoderFeedback(now) || !std::isfinite(length) || length <= 0) return false;
+        next.startLength[arm] = length;
+        next.readFailures[arm] = axis.getEncoderReadFailures();
+        next.largeSteps[arm] = axis.getEncoderLargeSteps();
+    }
+    Maslow.stopMotors();
+    savedAnchorHoldActive = false;
+    applyTensionRecovery = next;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        Maslow.axis[arm].reset();
+        Maslow.axis[arm].resetPID();
+    }
+    log_info("RESTORE profile=saved_anchors_jog_fit_r1 phase=preload center_frame_x=" << kinematics->getCenterX()
+             << " center_frame_y=" << kinematics->getCenterY()
+             << " sample_span_limit=" << MaslowSavedAnchorRecovery::repeatabilityLimitMm
+             << "mm geometry_limit=" << applyTensionMaxResidualMm << "mm");
+    return true;
+}
+
+bool Calibration::failApplyTension(const char* reason, bool referenceInvalid) {
+    const bool readyHold = currentState == READY_TO_CUT;
+    Maslow.stopMotors();
+    if (applyTensionRecovery.motionSettling) logSavedAnchorSettling("stopped", static_cast<uint32_t>(millis()));
+    if (applyTensionRecovery.sampling && !readyHold) logSavedAnchorSampling("stopped");
+    savedAnchorHoldActive = false;
+    applyTensionRecovery = ApplyTensionRecoveryState{};
+    takeSlack = false;
+    if (referenceInvalid) {
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) axis_homed[arm] = false;
+    }
+    // Do not persist failed measurements as a valid position reference.
+    // A quality failure alone does not invalidate a continuous encoder zero.
+    currentState = referenceInvalid ? UNKNOWN : EXTENDEDOUT;
+    sys.set_state(State::Alarm);
+    if (readyHold) {
+        Maslow.markBeltPositionsStale();
+        log_error("Ready hold stopped: " << reason << "; belt_reference_valid=" << !referenceInvalid
+                  << " error_mm TL=" << Maslow.axis[_TL].getPositionError() << " TR=" << Maslow.axis[_TR].getPositionError()
+                  << " BL=" << Maslow.axis[_BL].getPositionError() << " BR=" << Maslow.axis[_BR].getPositionError());
+    } else {
+        log_error("Apply Tension stopped: " << reason << "; belt_reference_valid=" << !referenceInvalid);
+    }
+    printCurrentState();
+    return true;
+}
+
+bool Calibration::applyTensionFeedbackHealthy(uint32_t now) {
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        if (!axis.hasFreshEncoderFeedback(now) || !std::isfinite(axis.getPosition())
+            || axis.getEncoderReadFailures() != applyTensionRecovery.readFailures[arm]
+            || axis.getEncoderLargeSteps() != applyTensionRecovery.largeSteps[arm]) return false;
+    }
+    return true;
+}
+
+bool Calibration::updateApplyTensionHold(uint32_t now) {
+    auto& recovery = applyTensionRecovery;
+    bool conflict = false;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        if (!axis.recomputeCalibrationHold()) {
+            failApplyTension("hold feedback unavailable", true);
+            return false;
+        }
+        conflict = conflict ||
+            (std::fabs(axis.getPosition() - axis.getTarget()) > 5.0
+             && std::fabs(axis.getMotorPower()) >= MaslowCalibrationHold::maxDrivePWM - 1.0);
+    }
+    if (!conflict) recovery.holdConflict = false;
+    else if (!recovery.holdConflict) {
+        recovery.holdConflict = true;
+        recovery.holdConflictStarted = now;
+    } else if (now - recovery.holdConflictStarted >= 1500) {
+        failApplyTension("position hold conflict at output limit", false);
+        return false;
+    }
+    return true;
+}
+
+bool Calibration::savedAnchorHoldSettled() {
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        if (!(std::fabs(axis.getPositionError()) <= MaslowCalibrationStability::maxPositionErrorMm)) return false;
+    }
+    return true;
+}
+
+bool Calibration::keepSettledSavedAnchorHold() {
+    if (sys.state() != State::Idle || currentState != READY_TO_CUT || !savedAnchorHoldActive ||
+        applyTensionRecovery.motionSettling || applyTensionRecovery.holdConflict ||
+        !all_axis_homed() || !allAxisExtended() ||
+        !applyTensionFeedbackHealthy(static_cast<uint32_t>(millis())) || !savedAnchorHoldSettled()) return false;
+
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if (!(std::fabs(Maslow.axis[arm].getCalibrationHoldVelocity()) <= 1.0)) return false;
+    }
+    log_info("Apply Tension complete using existing stable Ready hold");
+    return true;
+}
+
+void Calibration::logSavedAnchorSettling(const char* result, uint32_t now) const {
+    const auto& recovery = applyTensionRecovery;
+    log_info("MOTION_SETTLE result=" << result
+             << " elapsed_ms=" << static_cast<unsigned>(now - recovery.motionSettlingStarted)
+             << " longest_in_tolerance_ms=" << static_cast<unsigned>(recovery.longestMotionWithinToleranceMs)
+             << " required_ms=100 limit_mm=" << MaslowCalibrationStability::maxPositionErrorMm
+             << " outside_mask=" << recovery.motionOutsideToleranceMask
+             << " peak_error_mm TL=" << recovery.motionPeakError[_TL] << " TR=" << recovery.motionPeakError[_TR]
+             << " BL=" << recovery.motionPeakError[_BL] << " BR=" << recovery.motionPeakError[_BR]);
+}
+
+void Calibration::logSavedAnchorSampling(const char* result) const {
+    const auto& recovery = applyTensionRecovery;
+    log_info("RESTORE_SAMPLE result=" << result << " snapshots=" << recovery.snapshots
+             << " position_error_mask=" << recovery.samplePositionMask << " pwm_limit_mask=" << recovery.samplePwmMask
+             << " span_reset_mask=" << recovery.sampleDiagnostics.spanResetMask
+             << " gap_resets=" << recovery.sampleDiagnostics.observationGapResets
+             << " masks=TL1,TR2,BL4,BR8");
+}
+
+bool Calibration::beginSavedAnchorMotionSettling() {
+    if (!savedAnchorHoldActive || currentState != READY_TO_CUT) return false;
+
+    auto& recovery = applyTensionRecovery;
+    recovery.holdConflict = false;
+    recovery.motionSettling = true;
+    recovery.motionWithinTolerance = false;
+    recovery.longestMotionWithinToleranceMs = 0;
+    recovery.motionOutsideToleranceMask = 0;
+    std::fill_n(recovery.motionPeakError, ARM_COUNT, 0.0);
+    recovery.motionSettlingStarted = static_cast<uint32_t>(millis());
+    return true;
+}
+
+bool Calibration::maintainSavedAnchorHold() {
+    if (!savedAnchorHoldActive || currentState != READY_TO_CUT) return false;
+    const uint32_t now = static_cast<uint32_t>(millis());
+    if (!applyTensionFeedbackHealthy(now)) return failApplyTension("encoder feedback lost while holding Ready position", true);
+
+    auto& recovery = applyTensionRecovery;
+    if (recovery.motionSettling) {
+        const bool withinTolerance = savedAnchorHoldSettled();
+        if (withinTolerance && !recovery.motionWithinTolerance) recovery.motionWithinToleranceSince = now;
+        recovery.motionWithinTolerance = withinTolerance;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            const double error = Maslow.axis[arm].getPositionError();
+            if (std::fabs(error) > std::fabs(recovery.motionPeakError[arm])) recovery.motionPeakError[arm] = error;
+            if (!(std::fabs(error) <= MaslowCalibrationStability::maxPositionErrorMm))
+                recovery.motionOutsideToleranceMask |= 1u << arm;
+        }
+        if (withinTolerance) {
+            recovery.longestMotionWithinToleranceMs = std::max(recovery.longestMotionWithinToleranceMs,
+                                                               now - recovery.motionWithinToleranceSince);
+        }
+
+        if (withinTolerance && now - recovery.motionWithinToleranceSince >= 100) {
+            recovery.motionSettling = false;
+            Maslow.saveZPos();
+            Maslow.saveBeltPositions();
+            logSavedAnchorSettling("settled", now);
+        } else if (now - recovery.motionSettlingStarted >= 1500) {
+            return failApplyTension("motion endpoint did not settle", false);
+        } else {
+            // Keep tracking the final planned belt targets with the motion
+            // controller until they can be handed off to the lower-duty hold.
+            Maslow.recomputePID();
+            return true;
+        }
+    }
+
+    updateApplyTensionHold(now);
+    return true;
+}
+
 bool Calibration::takeSlackFunc() {
-    static int takeSlackState = 0;  //0 -> Starting, 1-> Moving to (0,0), 2-> Taking a measurement. Where should this be defined correctly?
-    static unsigned long holdTimer = millis();
-    static bool          retractionMonitorInitialized = false;
-    static float         startBeltPosition[ARM_COUNT] = { 0 };
+    auto& recovery = applyTensionRecovery;
+    const uint32_t now = static_cast<uint32_t>(millis());
+    if (!recovery.active) return failApplyTension("no active recovery", false);
+    if (!applyTensionFeedbackHealthy(now)) return failApplyTension("stale, failed or discontinuous encoder feedback", true);
+    if (now - recovery.started >= 60000) return failApplyTension("60-second recovery limit", false);
 
-    if (!retractionMonitorInitialized) {
-        for (int arm = _TL; arm < ARM_COUNT; arm++) {
-            startBeltPosition[arm] = Maslow.axis[arm].getPosition();
-        }
-        retractionMonitorInitialized = true;
-    }
-
-    for (int arm = _TL; arm < ARM_COUNT; arm++) {
-        const float retractedAmount = startBeltPosition[arm] - Maslow.axis[arm].getPosition();
-        if (applyTensionAllowLimiting && retractedAmount > applyTensionBeltRetractionLimitMm) {
-            for (int stopArm = _TL; stopArm < ARM_COUNT; stopArm++) {
-                Maslow.axis[stopArm].setTarget(Maslow.axis[stopArm].getPosition());
-                Maslow.axis[stopArm].stop();
-            }
-
-            log_warn("Maslow Apply Tension retraction warning: Belt "
-                     << Maslow.axis_id_to_label(arm).c_str() << " retracted " << retractedAmount
-                     << "mm while applying tension (limit " << applyTensionBeltRetractionLimitMm
-                     << "mm). A belt may not be anchored. Continue to keep retracting or Cancel to stop. Reduce Extend Dist or extend Belt Retraction Limit (Options) if Belts Attached to Anchors. Release Tension will allow Approx. 10mm of belt to be released.");
-
-            takeSlackState                = 0;
-            retractionMonitorInitialized  = false;
-            requestStateChange(EXTENDEDOUT);
-            return true;
+    float raw[ARM_COUNT];
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        raw[arm] = Maslow.axis[arm].getPosition();
+        if (applyTensionAllowLimiting && recovery.startLength[arm] - raw[arm] > applyTensionBeltRetractionLimitMm) {
+            const double amount = recovery.startLength[arm] - raw[arm];
+            const bool stopped = failApplyTension("belt retraction limit exceeded", false);
+            log_warn("RESTORE retraction arm=" << arm << " retracted_mm=" << amount
+                     << " limit_mm=" << applyTensionBeltRetractionLimitMm);
+            return stopped;
         }
     }
 
-    //Take a measurement
-    if (takeSlackState == 0) {
-        if (take_measurement_avg_with_check(
-                0, UP)) {  //We really shouldn't be using the first position to store the data, it should have it's own array
-
-            float x = 0;
-            float y = 0;
-            if (!computeXYfromLengths(calibration_data[0][0], calibration_data[0][1], x, y)) {
-                log_error("Failed to compute XY from lengths");
-                retractionMonitorInitialized = false;
-                return true;
-            }
-
-            auto kinematics = getKinematics();
-            if (!kinematics)
-            {
-                retractionMonitorInitialized = false;
-                return true;
-            }
-
-            // Get current Z position to accurately compute expected belt lengths
-            float* mpos     = get_mpos();
-            float  currentZ = mpos[2];  // Z position from motor position array
-
-            float extension = kinematics->getBeltEndExtension() + kinematics->getArmLength();
-
-            // Compute total vertical distances from each anchor to router (including current Z position)
-            float tlTotalZ = (currentZ + kinematics->getTlZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-            float trTotalZ = (currentZ + kinematics->getTrZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-            float blTotalZ = (currentZ + kinematics->getBlZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-            float brTotalZ = (currentZ + kinematics->getBrZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-
-            //This should use it's own array, this is not calibration data
-            float diff[ARM_COUNT];
-            diff[_TL] = calibration_data[0][0] - measurementToXYPlane(kinematics->computeTL(x, y, currentZ), tlTotalZ);
-            diff[_TR] = calibration_data[0][1] - measurementToXYPlane(kinematics->computeTR(x, y, currentZ), trTotalZ);
-            diff[_BL] = calibration_data[0][2] - measurementToXYPlane(kinematics->computeBL(x, y, currentZ), blTotalZ);
-            diff[_BR] = calibration_data[0][3] - measurementToXYPlane(kinematics->computeBR(x, y, currentZ), brTotalZ);
-            log_info("Center point deviation: TL: " << diff[_TL] << " TR: " << diff[_TR] << " BL: " << diff[_BL] << " BR: " << diff[_BR]);
-            constexpr double accurateThreshold = 12.0;
-            constexpr double warningThreshold  = 25.0;
-            const double      maxDeviation =
-                std::max(std::max(std::abs(diff[_TL]), std::abs(diff[_TR])), std::max(std::abs(diff[_BL]), std::abs(diff[_BR])));
-            if (maxDeviation > warningThreshold) {
-                log_error("Center point deviation over "
-                          << warningThreshold << "mm, your coordinate system is not accurate, maybe try running Find Anchors again?");
-                //Should we enter an alarm state here to prevent things from going wrong?
-
-                //Reset
-                takeSlackState = 0;
-                retractionMonitorInitialized = false;
-                requestStateChange(EXTENDEDOUT);
-                return true;
-            } else {
-                if (maxDeviation > accurateThreshold) {
-                    log_warn("Maslow Apply Tension deviation warning: Anchor point locations are inaccurate and the resulting cuts may not be precise. "
-                             "The tension in the belts may also be too high or too low, which can damage the belts. "
-                             "Measured center point deviation was " << maxDeviation << "mm.");
-                } else {
-                    log_info("Center point deviation within " << accurateThreshold << "mm, your coordinate system is accurate");
-                }
-                takeSlackState = 0;
-                holdTimer      = millis();
-                retractionMonitorInitialized = false;
-
-                // Instead of setting cartesian position and letting kinematics recalculate motor positions,
-                // we need to set the motor positions directly from the measured belt lengths to avoid
-                // position synchronization issues between hardware and FluidNC's motion planning system
-
-                // Get current motor position array
-                float* mpos     = get_mpos();
-                float  currentZ = mpos[2];
-
-                // Compute total vertical distances from each anchor to router (including current Z position)
-                float tlTotalZ = (currentZ + kinematics->getTlZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-                float trTotalZ = (currentZ + kinematics->getTrZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-                float blTotalZ = (currentZ + kinematics->getBlZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-                float brTotalZ = (currentZ + kinematics->getBrZ() + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness());
-
-                // Convert measured XY plane distances to actual belt lengths for motor positions
-                // calibration_data[0] contains measured XY plane distances: [TL, TR, BL, BR]
-                float beltLength[ARM_COUNT];
-                beltLength[_TL] = measurementFromXYPlane(calibration_data[0][0], tlTotalZ);
-                beltLength[_TR] = measurementFromXYPlane(calibration_data[0][1], trTotalZ);
-                beltLength[_BL] = measurementFromXYPlane(calibration_data[0][2], blTotalZ);
-                beltLength[_BR] = measurementFromXYPlane(calibration_data[0][3], brTotalZ);
-
-                // Set motor positions directly from measured belt lengths
-                // Axis mapping: A=TL(0), B=TR(1), C=BL(2), D=BR(3), Z=router(4)
-                set_motor_steps(0, mpos_to_steps(beltLength[_TL], 0));  // A axis = TL belt
-                set_motor_steps(1, mpos_to_steps(beltLength[_TR], 1));  // B axis = TR belt
-                set_motor_steps(2, mpos_to_steps(beltLength[_BL], 2));  // C axis = BL belt
-                set_motor_steps(3, mpos_to_steps(beltLength[_BR], 3));  // D axis = BR belt
-                // Z axis is left unchanged during Apply Tension process
-
-                // Verify that the position was set correctly by reading back from motors
-                float* verify_mpos = get_mpos();
-
-                gc_sync_position();  //This updates the Gcode engine with the new position from the stepping engine that we set with set_motor_steps
-                plan_sync_position();
-
-                sys.set_state(State::Idle);
-                requestStateChange(READY_TO_CUT);
-            }
+    if (!recovery.sampling && now - recovery.started >= 30000)
+        return failApplyTension("preload exceeded 30 seconds", false);
+    if (recovery.sampling && now - recovery.samplingStarted >= 12000)
+        return failApplyTension("no repeatable held samples within 12 seconds", false);
+    if (now - recovery.lastDiagnostic >= 1000) {
+        recovery.lastDiagnostic = now;
+        log_info("RESTORE phase=" << (recovery.sampling ? "sample" : "preload")
+                 << " elapsed_ms=" << now - recovery.started << " snapshots=" << recovery.snapshots
+                 << " TL=" << raw[_TL] << " TR=" << raw[_TR] << " BL=" << raw[_BL] << " BR=" << raw[_BR]);
+        if (!recovery.sampling) {
+            log_info("RESTORE preload_adc TL=" << Maslow.axis[_TL].getMotorCurrent() << " TR=" << Maslow.axis[_TR].getMotorCurrent()
+                     << " BL=" << Maslow.axis[_BL].getMotorCurrent() << " BR=" << Maslow.axis[_BR].getMotorCurrent()
+                     << " inward_pwm TL=" << -Maslow.axis[_TL].getMotorPower() << " TR=" << -Maslow.axis[_TR].getMotorPower()
+                     << " BL=" << -Maslow.axis[_BL].getMotorPower() << " BR=" << -Maslow.axis[_BR].getMotorPower());
         }
     }
+    if (!recovery.sampling) {
+        const uint32_t elapsed = now - recovery.lastPreloadUpdate;
+        if (elapsed < 10) return false;
+        recovery.lastPreloadUpdate = now;
+        const double seconds = std::min(elapsed, uint32_t(50)) / 1000.0;
+        const double threshold = retractCurrentThreshold;
 
-    //Position hold for 2 seconds
-    if (takeSlackState == 1) {
-        if (millis() - holdTimer > 2000) {
-            takeSlackState = 0;
-            retractionMonitorInitialized = false;
-            return true;
+        double current[ARM_COUNT], speed[ARM_COUNT];
+        bool allLoaded = true, anyLoaded = false, allResponding = true;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            auto& axis = Maslow.axis[arm];
+            current[arm] = axis.getMotorCurrent();
+            speed[arm] = axis.getBeltSpeed();
+            if (!std::isfinite(current[arm]) || current[arm] < 0 || !std::isfinite(speed[arm]))
+                return failApplyTension("invalid preload current or speed", false);
+
+            const bool loaded = recovery.preload[arm].duty > 0
+                && MaslowSavedAnchorRecovery::PreloadDrive::loaded(current[arm], speed[arm], threshold);
+            recovery.preloadResponding[arm] = recovery.preloadResponding[arm] || loaded || speed[arm] <= -2.0;
+            allResponding = allResponding && recovery.preloadResponding[arm];
+            allLoaded = allLoaded && loaded;
+            anyLoaded = anyLoaded || loaded;
         }
+
+        const double speedLimit = allResponding && !anyLoaded ? MaslowSavedAnchorRecovery::preloadSpeedMmPerSecond
+                                                             : MaslowSavedAnchorRecovery::preloadCreepMmPerSecond;
+        if (!recovery.stability.update(now, raw, allLoaded)) {
+            for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+                Maslow.axis[arm].driveIn(recovery.preload[arm].update(seconds, current[arm], speed[arm], threshold, speedLimit));
+            }
+            return false;
+        }
+
+        // All four belts have carried load at the same stable sled pose.
+        // Capture one encoder batch, then validate a second stable window under position hold.
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            auto& axis = Maslow.axis[arm];
+            axis.setTarget(raw[arm]);
+            axis.resetPID();
+        }
+        recovery.stability.reset();
+        recovery.sampling = true;
+        recovery.samplingStarted = now;
+        log_info("RESTORE phase=sample all four loaded references captured together"
+                 << " current_adc TL=" << current[_TL] << " TR=" << current[_TR]
+                 << " BL=" << current[_BL] << " BR=" << current[_BR]);
+        return false;
     }
 
-    return false;
+    if (!updateApplyTensionHold(now)) return true;
+    bool held = true;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        const bool positionOk = std::fabs(raw[arm] - axis.getTarget()) <= MaslowCalibrationStability::maxPositionErrorMm;
+        const bool pwmOk = std::fabs(axis.getMotorPower()) < MaslowCalibrationHold::maxDrivePWM - 1.0;
+        if (!positionOk) recovery.samplePositionMask |= 1u << arm;
+        if (!pwmOk) recovery.samplePwmMask |= 1u << arm;
+        held = held && positionOk && pwmOk;
+    }
+    if (!recovery.stability.update(now, raw, held, &recovery.sampleDiagnostics)) return false;
+    recovery.stability.reset();
+    if (recovery.snapshots >= 2) {
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) recovery.retained[recovery.snapshots - 2][arm] = raw[arm];
+    }
+    if (++recovery.snapshots < 6) return false;
+    const auto repeatability = MaslowCalibrationSamples::evaluate(recovery.retained);
+    if (repeatability.span > MaslowSavedAnchorRecovery::repeatabilityLimitMm) {
+        if (++recovery.replacements > 4) return failApplyTension("held samples exceeded 1 mm repeatability limit", false);
+        MaslowCalibrationSamples::slide(recovery.retained);
+        recovery.snapshots = 5;
+        log_info("RESTORE held sample rejected span_mm=" << repeatability.span);
+        return false;
+    }
+
+    auto kinematics = getKinematics();
+    if (!kinematics) return failApplyTension("saved geometry unavailable", false);
+    const float z = get_mpos()[Z_AXIS];
+    // The production forward model handles material thickness and fixedZ once.
+    const auto predict = [kinematics, z](int arm, double x, double y) {
+        return kinematics->compute(arm, x * Maslow.scaleX, y * Maslow.scaleY, z);
+    };
+    double mean[ARM_COUNT] = {};
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        for (int sample = 0; sample < 4; ++sample) mean[arm] += recovery.retained[sample][arm] * 0.25;
+    }
+    const auto fit = MaslowSavedAnchorRecovery::fitPosition(mean, predict, []() { serviceCalibrationWatchdogs(false); });
+    double latestMax = 0;
+    if (fit.converged) {
+        for (int arm = _TL; arm < ARM_COUNT; ++arm)
+            latestMax = std::max(latestMax, std::fabs(raw[arm] - predict(arm, fit.x, fit.y)));
+    }
+    log_info("RESTORE fit converged=" << fit.converged << " x=" << fit.x << " y=" << fit.y
+             << " rms_mm=" << fit.rms << " max_mm=" << fit.maxResidual << " latest_max_mm=" << latestMax
+             << " repeatability_mm=" << repeatability.span << " limit_mm=" << applyTensionMaxResidualMm);
+    if (!fit.converged) return failApplyTension("four-belt position fit did not converge", false);
+    if (!fit.acceptable(applyTensionMaxResidualMm) || latestMax >= applyTensionMaxResidualMm)
+        return failApplyTension("four-belt geometry residual exceeded recovery limit", false);
+    if (std::fabs(fit.x - Maslow.workAreaCenterOffsetX) > Maslow.workAreaX * 0.5
+        || std::fabs(fit.y - Maslow.workAreaCenterOffsetY) > Maslow.workAreaY * 0.5)
+        return failApplyTension("recovered position is outside the configured work area", false);
+
+    // Synchronize the planner with the settled encoder readings on entry to Ready.
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) Maslow.axis[arm].setTarget(raw[arm]);
+    recovery.active = false;
+    if (!requestStateChange(READY_TO_CUT)) return failApplyTension("Ready transition rejected", false);
+    savedAnchorHoldActive = true;
+    serviceCalibrationWatchdogs(false);
+    logSavedAnchorSampling("accepted");
+    log_info("Apply Tension complete using saved anchors; elapsed_ms=" << static_cast<uint32_t>(millis() - recovery.started));
+    return true;
 }
 
 /*
@@ -1465,8 +1708,9 @@ bool Calibration::computeXYfromLengths(double TL, double TR, float& x, float& y)
     if (!kinematics)
         return false;
 
-    double tlLength = TL;  //measurementToXYPlane(TL, tlZ);
-    double trLength = TR;  //measurementToXYPlane(TR, trZ);
+    if (!std::isfinite(TL) || !std::isfinite(TR) || TL <= 0 || TR <= 0) return false;
+    double tlLength = TL;
+    double trLength = TR;
 
     //Find the intersection of the two circles centered at tlX, tlY and trX, trY with radii tlLength and trLength
     double tlX = kinematics->getTlX();
@@ -1475,13 +1719,15 @@ bool Calibration::computeXYfromLengths(double TL, double TR, float& x, float& y)
     double trY = kinematics->getTrY();
 
     double d = sqrt((tlX - trX) * (tlX - trX) + (tlY - trY) * (tlY - trY));
-    if (d > tlLength + trLength || d < abs(tlLength - trLength)) {
+    if (!std::isfinite(d) || d < 1e-6 || d > tlLength + trLength || d < abs(tlLength - trLength)) {
         log_info("Unable to determine machine position");
         return false;
     }
 
     double a    = (tlLength * tlLength - trLength * trLength + d * d) / (2 * d);
-    double h    = sqrt(tlLength * tlLength - a * a);
+    const double hSquared = tlLength * tlLength - a * a;
+    if (hSquared < -1e-6) return false;
+    double h    = sqrt(std::max(0.0, hSquared));
     double x0   = tlX + a * (trX - tlX) / d;
     double y0   = tlY + a * (trY - tlY) / d;
     double rawX = x0 + h * (trY - tlY) / d;
@@ -1491,7 +1737,7 @@ bool Calibration::computeXYfromLengths(double TL, double TR, float& x, float& y)
     x = rawX - kinematics->getCenterX();
     y = rawY - kinematics->getCenterY();
 
-    return true;
+    return std::isfinite(x) && std::isfinite(y);
 }
 
 /**
@@ -1516,17 +1762,185 @@ bool Calibration::computeXYfromLengths(double TL, double TR, float& x, float& y)
  * @param waypoint The waypoint number being measured (0 = first waypoint).
  * @return True when the measurement is done, false otherwise.
  */
+// One preload per bootstrap waypoint. Repeated snapshots keep the same references;
+// they do not repeatedly pull all four belts and move the reference position.
+void Calibration::resetHorizontalSampling() {
+    horizontalSampling = HorizontalSamplingState{};
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) horizontalTight[arm] = false;
+    horizontalInitialTensionComplete = false;
+    horizontalHoldConflictStart = 0;
+}
+
+bool Calibration::failHorizontalSampling(const char* reason) {
+    Maslow.stopMotors();
+    log_error("Horizontal bootstrap measurement stopped: " << reason
+              << " wp=" << horizontalSampling.point);
+    resetHorizontalSampling();
+    // Do not let the normal EXTENDEDOUT failure transition persist a questionable
+    // reference. The acquisition wrapper exits to UNKNOWN for this new policy.
+    horizontalSamplingReferenceInvalid = true;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) axis_homed[arm] = false;
+    horizontalMeasurementFault = true;
+    return false;
+}
+
+bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, int point) {
+    const unsigned long now = millis();
+    constexpr unsigned long tensionTimeoutMs = 30000;
+    constexpr unsigned long settlingTimeoutMs = 8000;
+    if (horizontalSampling.point != point) {
+        resetHorizontalSampling();
+        horizontalSampling.point = point;
+        horizontalSampling.firstBottom = Maslow.x < 0 ? _BL : _BR;
+        horizontalSampling.phaseStarted = now;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            Maslow.axis[arm].stop();
+            Maslow.axis[arm].reset();
+            Maslow.axis[arm].resetPID();
+        }
+    }
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if (!std::isfinite(Maslow.axis[arm].getPosition()))
+            return failHorizontalSampling("non-finite encoder position");
+    }
+
+    if (!horizontalInitialTensionComplete) {
+        diagnosticStage("horizontal_initial_tighten");
+        if (static_cast<unsigned long>(now - horizontalSampling.phaseStarted) >= tensionTimeoutMs)
+            return failHorizontalSampling("initial tension exceeded 30 seconds");
+        // Preserve the existing preload behavior while other axes finish. This
+        // phase runs only once per waypoint, including across acquisition retries.
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            if (Maslow.axis[arm].pull_tight(current)) horizontalTight[arm] = true;
+        }
+        diagnosticTightMask = (horizontalTight[_TL] ? 1U : 0U) | (horizontalTight[_TR] ? 2U : 0U)
+                           | (horizontalTight[_BL] ? 4U : 0U) | (horizontalTight[_BR] ? 8U : 0U);
+        if (diagnosticTightMask != 15U) return false;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            Maslow.axis[arm].stop();
+            Maslow.axis[arm].reset();
+            Maslow.axis[arm].resetPID();
+            horizontalSampling.readFailures[arm] = Maslow.axis[arm].getEncoderReadFailures();
+            horizontalSampling.largeSteps[arm] = Maslow.axis[arm].getEncoderLargeSteps();
+        }
+        Maslow.axis[_TL].setTarget(Maslow.axis[_TL].getPosition());
+        Maslow.axis[_TR].setTarget(Maslow.axis[_TR].getPosition());
+        horizontalTight[_BL] = horizontalTight[_BR] = false;
+        horizontalInitialTensionComplete = true;
+        horizontalSampling.phaseStarted = now;
+        log_info("CALDIAG hold_policy kp=" << MaslowCalibrationHold::proportionalGain
+                 << " kd=" << MaslowCalibrationHold::velocityDamping
+                 << " effective_pwm_limit=" << MaslowCalibrationHold::maxDrivePWM
+                 << " pwm_slew_per_s=" << MaslowCalibrationHold::maxSlewPWMPerSecond);
+        log_info("CALDIAG fixed_reference wp=" << point << " TL=" << Maslow.axis[_TL].getTarget()
+                 << " TR=" << Maslow.axis[_TR].getTarget());
+        return false;
+    }
+
+    // Once reference positions are fixed, a discontinuity cannot be repaired by
+    // waiting for the wrong cumulative value to look stable. Stop before PID uses it.
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if (Maslow.axis[arm].getEncoderReadFailures() != horizontalSampling.readFailures[arm]
+            || Maslow.axis[arm].getEncoderLargeSteps() != horizontalSampling.largeSteps[arm]) {
+            log_error("CALDIAG fixed_reference_feedback_fault wp=" << point << " arm=" << arm);
+            return failHorizontalSampling("encoder feedback changed after reference capture");
+        }
+    }
+
+    if (!horizontalSampling.holdingSamples) {
+        diagnosticStage("horizontal_tension_fixed_reference");
+        if (static_cast<unsigned long>(now - horizontalSampling.phaseStarted) >= tensionTimeoutMs)
+            return failHorizontalSampling("bottom tension exceeded 30 seconds");
+        if (!Maslow.axis[_TL].recomputeCalibrationHold() || !Maslow.axis[_TR].recomputeCalibrationHold())
+            return failHorizontalSampling("stale or invalid hold feedback");
+        // Keep a completed bottom belt at its captured position while the other
+        // belt tightens. Previously it was left without active position control.
+        for (int arm = _BL; arm <= _BR; ++arm) {
+            if (horizontalTight[arm] && !Maslow.axis[arm].recomputeCalibrationHold())
+                return failHorizontalSampling("stale or invalid hold feedback");
+        }
+        const int first = horizontalSampling.firstBottom;
+        const int second = first == _BL ? _BR : _BL;
+        const int pulling = !horizontalTight[first] ? first : second;
+        if (!horizontalTight[pulling] && Maslow.axis[pulling].pull_tight(current)) {
+            horizontalTight[pulling] = true;
+            Maslow.axis[pulling].setTarget(Maslow.axis[pulling].getPosition());
+            Maslow.axis[pulling].resetPID();
+        }
+        diagnosticTightMask = 3U | (horizontalTight[_BL] ? 4U : 0U) | (horizontalTight[_BR] ? 8U : 0U);
+        if (horizontalTight[_BL] && horizontalTight[_BR]) {
+            horizontalSampling.holdingSamples = true;
+            horizontalSampling.phaseStarted = now;
+            horizontalSampling.stability.reset();
+        }
+    } else {
+        diagnosticStage("horizontal_settle_fixed_reference");
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            if (!Maslow.axis[arm].recomputeCalibrationHold())
+                return failHorizontalSampling("stale or invalid hold feedback");
+        }
+        diagnosticTightMask = 15U;
+    }
+
+    bool holdConflict = false;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if ((arm == _TL || arm == _TR || horizontalTight[arm])
+            && std::fabs(Maslow.axis[arm].getPosition() - Maslow.axis[arm].getTarget()) > 25.0
+            && std::fabs(Maslow.axis[arm].getMotorPower()) >= MaslowCalibrationHold::maxDrivePWM - 1.0)
+            holdConflict = true;
+    }
+    if (holdConflict) {
+        if (horizontalHoldConflictStart == 0) horizontalHoldConflictStart = now;
+        else if (static_cast<unsigned long>(now - horizontalHoldConflictStart) >= 1500)
+            return failHorizontalSampling("hold target conflict at hold output limit");
+    } else {
+        horizontalHoldConflictStart = 0;
+    }
+    if (!horizontalSampling.holdingSamples) return false;
+    if (static_cast<unsigned long>(now - horizontalSampling.phaseStarted) >= settlingTimeoutMs)
+        return failHorizontalSampling("no stable sampling window within 8 seconds");
+
+    float position[ARM_COUNT];
+    bool held = true;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        position[arm] = Maslow.axis[arm].getPosition();
+        held = held && std::fabs(position[arm] - Maslow.axis[arm].getTarget())
+                           <= MaslowCalibrationStability::maxPositionErrorMm
+                    && std::fabs(Maslow.axis[arm].getMotorPower()) < 1000.0;
+    }
+    if (!horizontalSampling.stability.update(static_cast<uint32_t>(now), position, held)) return false;
+    auto kinematics = getKinematics();
+    if (!kinematics) return failHorizontalSampling("kinematics unavailable");
+    const float z = get_mpos()[2] + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness();
+    const float zOffset[ARM_COUNT] = { kinematics->getTlZ(), kinematics->getTrZ(),
+                                      kinematics->getBlZ(), kinematics->getBrZ() };
+    for (int arm = _TL; arm < ARM_COUNT; ++arm)
+        result[arm] = measurementToXYPlane(position[arm], z + zOffset[arm]);
+    log_info("CALDIAG measurement wp=" << point << " run=" << diagnosticRun
+             << " TL=" << result[_TL] << " TR=" << result[_TR]
+             << " BL=" << result[_BL] << " BR=" << result[_BR]);
+    // Each of the six acquisitions needs its own continuously observed window.
+    // All motor targets and the preload state survive warm-ups and rolling retries.
+    horizontalSampling.stability.reset();
+    horizontalSampling.phaseStarted = now;
+    return true;
+}
+
 bool Calibration::take_measurement(float result[4], int dir, int run, int current, int waypoint) {
     serviceCalibrationWatchdogs(false);
     diagnosticRun = run;
     diagnosticCurrentThreshold = current;
+    // Apply Tension and vertical/grid measurements retain their existing policy.
+    if (orientation == HORIZONTAL && calibrationInProgress && waypoint <= 5) {
+        return takeStableHorizontalMeasurement(result, current, waypoint);
+    }
     if (orientation == VERTICAL || waypoint > 5) diagnosticStage("measure");
 
     //Shouldn't this be handled with the same code as below but with the direction set to UP?
     if (orientation == VERTICAL) {
         //first we pull two bottom belts tight one after another, if x<0 we pull left belt first, if x>0 we pull right belt first
-        static bool BL_tight = false;
-        static bool BR_tight = false;
+        bool& BL_tight = measurementState.bottomLeftTight;
+        bool& BR_tight = measurementState.bottomRightTight;
         Maslow.axis[_TL].recomputePID();
         Maslow.axis[_TR].recomputePID();
 
@@ -1751,12 +2165,12 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
         }
         // For subsequent waypoints (6+), pull belts simultaneously for faster measurements
         else {
-            static MotorUnit* pullAxis1;
-            static MotorUnit* pullAxis2;
-            static MotorUnit* holdAxis1;
-            static MotorUnit* holdAxis2;
-            static bool       pull1_tight = false;
-            static bool       pull2_tight = false;
+            MotorUnit* pullAxis1;
+            MotorUnit* pullAxis2;
+            MotorUnit* holdAxis1;
+            MotorUnit* holdAxis2;
+            bool& pull1_tight = measurementState.pull1Tight;
+            bool& pull2_tight = measurementState.pull2Tight;
             switch (dir) {
                 case UP:
                     holdAxis1 = &Maslow.axis[_TL];
@@ -1846,53 +2260,40 @@ bool Calibration::take_measurement(float result[4], int dir, int run, int curren
     return false;
 }
 
-static float** measurements = nullptr;
-
-void allocateMeasurements() {
-    measurements = new float*[4];
-    for (int i = 0; i < 4; ++i) {
-        measurements[i] = new float[4];
-    }
-}
-
-void freeMeasurements() {
-    for (int i = 0; i < 4; ++i) {
-        delete[] measurements[i];
-    }
-    delete[] measurements;
-    measurements = nullptr;
-}
-
-// Takes a series of measurements, calculates average and records calibration data;  Returns true when it's done and the result has been stored
-// There is way too much being done in this function. It needs to be split apart and cleaned up
 bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
-    //take 5 measurements in a row, (ignoring the first one), if they are all within 1mm of each other, take the average and record it to the calibration data array
-    static int   run         = 0;
-    static float avg         = 0;
-    static float sum         = 0;
-    static bool  measureFlex = false;
-    static int   criticalCounter = 0;
-
-    if (measurements == nullptr) {
-        allocateMeasurements();  //This is structured [[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]],[[tl],[tr],[bl],[br]]
-    }
-
-    int howHardToPull = retractCurrentThreshold;
-    if (measureFlex) {
-        howHardToPull = retractCurrentThreshold + 500;
-    }
+    // Discard two settling samples once, then check a rolling window of four snapshots.
+    int& run = measurementState.run;
+    int& criticalCounter = measurementState.retries;
+    auto& measurements = measurementState.samples;
+    float avg = 0, sum = 0;
+    const float repeatabilityLimit = calibrationBootstrap17 ? BOOTSTRAP17_REPEATABILITY_MM : 2.5f;
+    const int howHardToPull = retractCurrentThreshold;
 
     const bool measurementTaken = take_measurement(measurements[max(run - 2, 0)], dir, run, howHardToPull, waypoint);
     if (horizontalMeasurementFault) {
+        const bool referenceInvalid = horizontalSamplingReferenceInvalid;
         run = 0;
         criticalCounter = 0;
         horizontalMeasurementFault = false;
-        if (measurements != nullptr) freeMeasurements();
         resetCalibrationState();
-        requestStateChange(EXTENDEDOUT);
+        // UNKNOWN does not save positions. Legacy Apply Tension/other faults keep
+        // their existing transition; only fixed-reference sampling invalidates it.
+        // A failed direct-motor calibration must leave FluidNC Homing as well.
+        // Keep the invalid reference and UNKNOWN state; do not save/re-enable motion.
+        if (referenceInvalid) sys.set_state(State::Alarm);
+        requestStateChange(referenceInvalid ? UNKNOWN : EXTENDEDOUT);
         return false;
     }
     if (measurementTaken) {  //Throw away measurements are stored in [0]
+        for (int arm = 0; arm < ARM_COUNT; ++arm) {
+            const float sample = measurements[max(run - 2, 0)][arm];
+            if (!std::isfinite(sample) || sample <= 0.0f) {
+                log_error("Find Anchors stopped: invalid belt measurement at waypoint " << waypoint << " arm=" << arm);
+                resetCalibrationState();
+                requestStateChange(EXTENDEDOUT);
+                return false;
+            }
+        }
         if (run < 2) {
             run++;
             return false;  //discard the first two measurements
@@ -1903,42 +2304,39 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
         if (run > 5) {
             run = 0;
 
-            //check if all measurements are within 1mm of each other
-            float maxDeviation[4] = { 0 };
-            float maxDeviationAbs = 0;
-            for (int i = 0; i < 4; i++) {
-                for (int j = 0; j < 3; j++) {
-                    //find max deviation between measurements
-                    maxDeviation[i] = max(maxDeviation[i], abs(measurements[j][i] - measurements[j + 1][i]));
+            // A whole-window range catches cumulative drift that adjacent differences miss.
+            const auto quality = MaslowCalibrationSamples::evaluate(measurements);
+            static const char* const armLabels[ARM_COUNT] = { "TL", "TR", "BL", "BR" };
+            if (quality.span > repeatabilityLimit) {
+                log_error("Measurement error: repeatability span " << quality.span
+                          << "mm exceeds " << repeatabilityLimit << "mm; retrying waypoint " << waypoint);
+                log_info("CALDIAG repeatability wp=" << waypoint << " axis=" << armLabels[quality.arm]
+                         << " span_mm=" << quality.span << " adjacent_mm=" << quality.adjacent
+                         << " min_sample=" << quality.minimumSample << " max_sample=" << quality.maximumSample);
+                // One compact row per sample, using arm order rather than encoder-port labels.
+                for (int sample = 0; sample < 4; ++sample) {
+                    log_info("CALDIAG retained sample=" << sample
+                             << " TL=" << measurements[sample][_TL] << " TR=" << measurements[sample][_TR]
+                             << " BL=" << measurements[sample][_BL] << " BR=" << measurements[sample][_BR]);
                 }
-            }
-
-            for (int i = 0; i < 4; i++) {
-                maxDeviationAbs = max(maxDeviationAbs, maxDeviation[i]);
-            }
-            if (maxDeviationAbs > 2.5) {
-                log_error("Measurement error, measurements are not within 2.5 mm of each other, trying again");
-                log_info("Max deviation: " << maxDeviationAbs);
-
-                //print all the measurements in readable form:
-                for (int i = 0; i < 4; i++) {
-                    for (int j = 0; j < 4; j++) {
-                        //use axis id to label:
-                        log_info(Maslow.axis_id_to_label(i).c_str() << " " << measurements[j][i]);
-                    }
-                }
-                //reset the run counter to run the measurements again
-                if (criticalCounter++ > 8) {  //This updates the counter and checks
-                    log_error("Critical error, measurements are not within 1.5mm of each other 8 times in a row, stopping Find Anchors");
+                // The previous ten six-acquisition batches allowed 60 acquisitions.
+                // Two warm-ups + four initial snapshots + 54 replacements keep that bound.
+                if (++criticalCounter >= 55) {
+                    log_error("Find Anchors stopped: 60 acquisitions without a stable four-sample window; limit "
+                              << repeatabilityLimit << "mm");
                     resetCalibrationState();
                     criticalCounter = 0;
-                    freeMeasurements();
                     requestStateChange(EXTENDEDOUT);
                     return false;
                 }
-                freeMeasurements();
+                // Warm-up occurs once per waypoint. Replace only the oldest snapshot, then
+                // require four consecutive coherent snapshots before accepting their mean.
+                MaslowCalibrationSamples::slide(measurements);
+                run = 5;  // The next acquisition writes sample[3] and checks the new window.
                 return false;
             }
+            log_info("CALDIAG repeatability_ok wp=" << waypoint << " span_mm=" << quality.span
+                     << " windows_rejected=" << criticalCounter);
 
             //If we are measurring the flex we don't want to save the result and instead we want to compare it to the last result
             // COMMENTED OUT: Frame flex measurement calculation disabled
@@ -1957,7 +2355,6 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
 
                 measureFlex = false;
 
-                freeMeasurements();  //We have completed this measurement, but we don't want to store anything this time
                 return true;
             }
             */
@@ -2001,7 +2398,6 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
                         Maslow.eStop("Unable to find a valid frame size to match the first measurement");
                         resetCalibrationState();
                         criticalCounter = 0;
-                        freeMeasurements();
                         requestStateChange(EXTENDEDOUT);
                         return false;
                     }
@@ -2012,7 +2408,6 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
                     Maslow.eStop("Unable to find machine position from measurements");
                     resetCalibrationState();
                     criticalCounter = 0;
-                    freeMeasurements();
                     requestStateChange(EXTENDEDOUT);
                     return false;
                 }
@@ -2023,20 +2418,19 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
                 calibrationGrid[0][0] =
                     x;  //This first point is never really used because we've already measured here, but it shouldn't be left undefined
                 calibrationGrid[0][1] = y;
-                calibrationGrid[1][0] = x + 150;
+                calibrationGrid[1][0] = x + coarseStepX;
                 calibrationGrid[1][1] = y;
-                calibrationGrid[2][0] = x + 150;
-                calibrationGrid[2][1] = y + 150;
+                calibrationGrid[2][0] = x + coarseStepX;
+                calibrationGrid[2][1] = y + coarseStepY;
                 calibrationGrid[3][0] = x;
-                calibrationGrid[3][1] = y + 150;
-                calibrationGrid[4][0] = x - 150;
-                calibrationGrid[4][1] = y + 150;
-                calibrationGrid[5][0] = x - 150;
+                calibrationGrid[3][1] = y + coarseStepY;
+                calibrationGrid[4][0] = x - coarseStepX;
+                calibrationGrid[4][1] = y + coarseStepY;
+                calibrationGrid[5][0] = x - coarseStepX;
                 calibrationGrid[5][1] = y;
             }
 
             //This is the exit to indicate that the measurement was successful
-            freeMeasurements();
 
             //Special case where we have a good measurement but we need to take another at this point to measure the flex of the frame
             //Frame flex should only be measured during calibration process, not during "Apply Tension"
@@ -2056,29 +2450,47 @@ bool Calibration::take_measurement_avg_with_check(int waypoint, int dir) {
     return false;
 }
 
-// Move pulling just two belts depending in the direction of the movement
+// Use slack before the first fit, then follow the selected calibrated move policy.
 bool Calibration::move_with_slack(double fromX, double fromY, double toX, double toY) {
     diagnosticStage("move");
     serviceCalibrationWatchdogs(false);
 
     //This is where we want to introduce some slack so the system
-    static unsigned long moveBeginTimer = millis();
-    static bool          decompress     = true;
+    unsigned long& moveBeginTimer = measurementState.moveBegin;
+    bool& decompress = measurementState.moveNeedsInit;
     float                stepSize       = 0.09;  // Increased by 50% from 0.06 for faster calibration movement
 
-    static int direction = UP;
+    int& direction = measurementState.moveDirection;
 
-    static float xStepSize = 1;
-    static float yStepSize = 1;
+    float& xStepSize = measurementState.xStep;
+    float& yStepSize = measurementState.yStep;
+    bool& tlExtending = measurementState.tlExtending;
+    bool& trExtending = measurementState.trExtending;
+    bool& blExtending = measurementState.blExtending;
+    bool& brExtending = measurementState.brExtending;
 
-    static bool tlExtending = false;
-    static bool trExtending = false;
-    static bool blExtending = false;
-    static bool brExtending = false;
+    if (!std::isfinite(fromX) || !std::isfinite(fromY) || !std::isfinite(toX) || !std::isfinite(toY)) {
+        Maslow.eStop("Invalid calibration movement coordinates");
+        return false;
+    }
+    if (std::abs(toX - fromX) < 1e-6 && std::abs(toY - fromY) < 1e-6) {
+        for (int arm = 0; arm < ARM_COUNT; ++arm) {
+            Maslow.axis[arm].setTarget(Maslow.axis[arm].getPosition());
+            Maslow.axis[arm].stop();
+            Maslow.axis[arm].reset();
+        }
+        decompress = true;
+        measurementState.stabilizeTimer = 0;
+        return true;
+    }
 
     bool withSlack = true;
     if (waypoint > recomputePoints[0]) {  //If we have completed the first round of calibraiton
         withSlack = false;
+    }
+
+    if (calibrationBootstrap17 && orientation == HORIZONTAL && !withSlack) {
+        return moveCalibratedHorizontal(fromX, fromY, toX, toY);
     }
 
     //This runs once at the beginning of the move
@@ -2180,7 +2592,7 @@ bool Calibration::move_with_slack(double fromX, double fromY, double toX, double
         }
 
         // Small delay to allow stabilization
-        static unsigned long stabilizeTimer = 0;
+        unsigned long& stabilizeTimer = measurementState.stabilizeTimer;
         if (stabilizeTimer == 0) {
             stabilizeTimer = millis();
             return false;  // Continue stabilizing
@@ -2190,54 +2602,7 @@ bool Calibration::move_with_slack(double fromX, double fromY, double toX, double
         }
         stabilizeTimer = 0;  // Reset for next waypoint
 
-        // Now stop and reset only the belts that should be slack for the upcoming measurement
-        if (orientation == VERTICAL) {
-            // In vertical mode, maintain top belt tension, allow bottom belts to slack
-            Maslow.axis[_BL].stop();
-            Maslow.axis[_BR].stop();
-            // Reset only the stopped axes
-            Maslow.axis[_BL].reset();
-            Maslow.axis[_BR].reset();
-        } else {
-            // In horizontal mode, stop belts based on measurement direction
-            int measurementDirection = get_direction(fromX, fromY, toX, toY);
-            switch (measurementDirection) {
-                case UP:
-                    // TL and TR will be hold belts, stop BL and BR
-                    Maslow.axis[_BL].stop();
-                    Maslow.axis[_BR].stop();
-                    // Reset only the stopped axes
-                    Maslow.axis[_BL].reset();
-                    Maslow.axis[_BR].reset();
-                    break;
-                case DOWN:
-                    // BL and BR will be hold belts, stop TL and TR
-                    Maslow.axis[_TL].stop();
-                    Maslow.axis[_TR].stop();
-                    // Reset only the stopped axes
-                    Maslow.axis[_TL].reset();
-                    Maslow.axis[_TR].reset();
-                    break;
-                case LEFT:
-                    // TL and BL will be hold belts, stop TR and BR
-                    Maslow.axis[_TR].stop();
-                    Maslow.axis[_BR].stop();
-                    // Reset only the stopped axes
-                    Maslow.axis[_TR].reset();
-                    Maslow.axis[_BR].reset();
-                    break;
-                case RIGHT:
-                    // TR and BR will be hold belts, stop TL and BL
-                    Maslow.axis[_TL].stop();
-                    Maslow.axis[_BL].stop();
-                    // Reset only the stopped axes
-                    Maslow.axis[_TL].reset();
-                    Maslow.axis[_BL].reset();
-                    break;
-            }
-        }
-
-        decompress = true;  //Reset for the next pass
+        finishCalibrationMove(direction);
         return true;
     }
 
@@ -2282,64 +2647,161 @@ bool Calibration::move_with_slack(double fromX, double fromY, double toX, double
     return false;  //We have not yet reached our target position
 }
 
+// Transfer the same holding pair to the measurement phase in either move mode.
+void Calibration::finishCalibrationMove(int direction) {
+    int first = _BL;
+    int second = _BR;
+    if (orientation != VERTICAL) {
+        switch (direction) {
+            case DOWN:
+                first = _TL;
+                second = _TR;
+                break;
+            case LEFT:
+                first = _TR;
+                second = _BR;
+                break;
+            case RIGHT:
+                first = _TL;
+                second = _BL;
+                break;
+        }
+    }
+    Maslow.axis[first].stop();
+    Maslow.axis[second].stop();
+    Maslow.axis[first].reset();
+    Maslow.axis[second].reset();
+    measurementState.moveNeedsInit = true;
+}
+
+// Once the first anchor fit is available, advance all four belts on a shared XY trajectory.
+bool Calibration::moveCalibratedHorizontal(double fromX, double fromY, double toX, double toY) {
+    constexpr double peakSpeedMmPerSecond = 30.0;
+    constexpr double endpointToleranceMm = 2.0;
+    constexpr double pauseTrackingErrorMm = 4.0;
+    constexpr unsigned long settledMs = 150;
+    constexpr unsigned long maxUpdateMs = 20;
+
+    const double dx = toX - fromX;
+    const double dy = toY - fromY;
+    // The quintic interpolator's peak slope is 1.875 with zero endpoint velocity and acceleration.
+    const double durationMs = std::max(500.0, 1875.0 * std::hypot(dx, dy) / peakSpeedMmPerSecond);
+    const unsigned long now = millis();
+    auto& move = measurementState;
+    if (move.moveNeedsInit) {
+        if (!getKinematics()) {
+            Maslow.eStop("Kinematics unavailable for calibration move");
+            return false;
+        }
+        move.moveNeedsInit = false;
+        move.moveBegin = move.moveLastUpdate = now;
+        move.moveElapsedMs = 0;
+        move.stabilizeTimer = 0;
+        Maslow.setTargets(fromX, fromY, 0);
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            auto& axis = Maslow.axis[arm];
+            // Apply geometric belt-length changes to the measured starting lengths.
+            // Carry the offset through this segment so starting tension does not jump.
+            move.moveBeltOffset[arm] = axis.getPosition() - axis.getTarget();
+            axis.setTarget(axis.getPosition());
+            axis.resetPID();
+        }
+        log_info("CALDIAG move_profile wp=" << waypoint << " duration_ms=" << durationMs
+                 << " peak_speed_mm_s=" << peakSpeedMmPerSecond);
+    }
+
+    if (now - move.moveBegin >= 3.0 * durationMs + 3000.0) {
+        log_error("CALDIAG move_timeout wp=" << waypoint << " profile_elapsed_ms=" << move.moveElapsedMs);
+        Maslow.eStop("Calibration move failed to track or settle");
+        return false;
+    }
+
+    double maxError = 0.0;
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        maxError = std::max(maxError, std::fabs(Maslow.axis[arm].getPositionError()));
+    }
+    // Slow the common trajectory as any belt falls behind. Bound the advance after loop delays.
+    const double pace = std::max(0.0, std::min(1.0, (pauseTrackingErrorMm - maxError)
+                                                      / (pauseTrackingErrorMm - endpointToleranceMm)));
+    const unsigned long deltaMs = std::min(now - move.moveLastUpdate, maxUpdateMs);
+    move.moveLastUpdate = now;
+    move.moveElapsedMs = std::min(durationMs, move.moveElapsedMs + deltaMs * pace);
+    const double t = move.moveElapsedMs / durationMs;
+    const double progress = t * t * t * (10.0 + t * (-15.0 + 6.0 * t));
+    Maslow.setTargets(fromX + dx * progress, fromY + dy * progress, 0);
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& axis = Maslow.axis[arm];
+        axis.setTarget(axis.getTarget() + move.moveBeltOffset[arm]);
+    }
+    Maslow.recomputePID();
+    if (!calibrationInProgress) return false;
+
+    // Keep tracking the same final targets until all four belts are in tolerance.
+    if (t < 1.0 || maxError > endpointToleranceMm) {
+        move.stabilizeTimer = 0;
+        return false;
+    }
+    if (move.stabilizeTimer == 0) move.stabilizeTimer = now;
+    if (now - move.stabilizeTimer < settledMs) return false;
+
+    move.stabilizeTimer = 0;
+    log_info("CALDIAG move_settled wp=" << waypoint << " max_error_mm=" << maxError
+             << " elapsed_ms=" << static_cast<unsigned int>(now - move.moveBegin));
+    finishCalibrationMove(get_direction(fromX, fromY, toX, toY));
+    return true;
+}
+
 //The number of points high and wide  must be an odd number
 bool Calibration::generate_calibration_grid() {
     //Allocate memory for the calibration grid
     allocateCalibrationMemory();
 
-    float xSpacing = calibration_grid_width_mm_X / (calibrationGridSize - 1);
-    float ySpacing = calibration_grid_height_mm_Y / (calibrationGridSize - 1);
-
-    //If either dimension is set to zero we automatically compute it as half the frame size
-    if (calibration_grid_height_mm_Y == 0 || calibration_grid_width_mm_X == 0) {
-        float frameWidth  = getKinematics()->getTrX() - getKinematics()->getTlX();
-        float frameHeight = getKinematics()->getTlY() - getKinematics()->getBlY();
-
-        // Calculate initial grid size based on frame dimensions
-        float gridWidth  = frameWidth * 0.5;
-        float gridHeight = frameHeight * 0.2;
-
-        // Constrain grid to be at most 200mm less than work area to ensure it stays within bounds
-        float maxGridWidth  = Maslow.workAreaX - 200.0;
-        float maxGridHeight = Maslow.workAreaY - 200.0;
-
-        if (gridWidth > maxGridWidth) {
-            gridWidth = maxGridWidth;
-            log_info("Grid width constrained to work area: " << gridWidth << " mm (work area X: " << Maslow.workAreaX << " mm)");
-        }
-        if (gridHeight > maxGridHeight) {
-            gridHeight = maxGridHeight;
-            log_info("Grid height constrained to work area: " << gridHeight << " mm (work area Y: " << Maslow.workAreaY << " mm)");
-        }
-
-        // Automatically select the grid spacing (3x3, 5x5, 7x7, or 9x9) such that
-        // the smallest grid is used which will not leave more than 260mm between each point
-        const int availableGridSizes[] = { 3, 5, 7, 9 };
-        const int numGridSizes         = sizeof(availableGridSizes) / sizeof(availableGridSizes[0]);
-        int       selectedGridSize     = availableGridSizes[numGridSizes - 1];  // Default to largest grid size
-
-        // Try each grid size from smallest to largest
-        for (int i = 0; i < numGridSizes; i++) {
-            int   trySize       = availableGridSizes[i];
-            float tryXSpacing   = gridWidth / (trySize - 1);
-            float tryYSpacing   = gridHeight / (trySize - 1);
-            float maxTrySpacing = max(tryXSpacing, tryYSpacing);
-
-            if (maxTrySpacing <= calibrationMaxSpacingMm) {
-                selectedGridSize = trySize;
-                break;  // Found the smallest grid that satisfies the constraint
+    auto kinematics = getKinematics();
+    if (!kinematics) return false;
+    int gridSize = calibrationBootstrap17 ? 3 : calibrationGridSize;
+    const bool automatic = calibration_grid_width_mm_X == 0 || calibration_grid_height_mm_Y == 0;
+    float gridWidth = calibration_grid_width_mm_X;
+    float gridHeight = calibration_grid_height_mm_Y;
+    if (automatic) {
+        gridWidth = (kinematics->getTrX() - kinematics->getTlX()) * 0.5f;
+        gridHeight = (kinematics->getTlY() - kinematics->getBlY()) * 0.2f;
+    }
+    if (automatic || calibrationBootstrap17) {
+        gridWidth = std::min(gridWidth, Maslow.workAreaX - 200.0f);
+        gridHeight = std::min(gridHeight, Maslow.workAreaY - 200.0f);
+    }
+    if (calibrationBootstrap17) {
+        // Keep the existing spacing ceiling even though we now always use 3x3.
+        gridWidth = std::min(gridWidth, 2.0f * calibrationMaxSpacingMm);
+        gridHeight = std::min(gridHeight, 2.0f * calibrationMaxSpacingMm);
+    }
+    if (!std::isfinite(gridWidth) || !std::isfinite(gridHeight) || gridWidth <= 0 || gridHeight <= 0) {
+        log_error("Invalid calibration range: width=" << gridWidth << " height=" << gridHeight
+                  << "; work area must allow the 200mm margin");
+        return false;
+    }
+    if (automatic && !calibrationBootstrap17) {
+        const int availableGridSizes[] = {3, 5, 7, 9};
+        gridSize = 9;
+        for (int size : availableGridSizes) {
+            if (std::max(gridWidth, gridHeight) / (size - 1) <= calibrationMaxSpacingMm) {
+                gridSize = size;
+                break;
             }
         }
-
-        calibrationGridSize = selectedGridSize;
-
-        xSpacing = gridWidth / (calibrationGridSize - 1);
-        ySpacing = gridHeight / (calibrationGridSize - 1);
     }
+    if (gridSize != 3 && gridSize != 5 && gridSize != 7 && gridSize != 9) {
+        log_error("Invalid calibration grid size: " << gridSize);
+        return false;
+    }
+    const float xSpacing = gridWidth / (gridSize - 1);
+    const float ySpacing = gridHeight / (gridSize - 1);
+    coarseStepX = calibrationBootstrap17 ? std::min(150.0f, gridWidth * 0.5f) : 150.0f;
+    coarseStepY = calibrationBootstrap17 ? std::min(150.0f, gridHeight * 0.5f) : 150.0f;
 
     int numberOfCycles = 0;
 
-    switch (calibrationGridSize) {
+    switch (gridSize) {
         case 3:
             numberOfCycles = 1;  // 3x3 grid
             break;
@@ -2353,7 +2815,7 @@ bool Calibration::generate_calibration_grid() {
             numberOfCycles = 4;  // 9x9 grid
             break;
         default:
-            log_error("Invalid " + M + "_calibration_grid_size: " << calibrationGridSize);
+            log_error("Invalid " + M + "_calibration_grid_size: " << gridSize);
             return false;  // return false or handle error appropriately
     }
 
@@ -2423,7 +2885,13 @@ bool Calibration::generate_calibration_grid() {
     calibrationGrid[pointCount][1] = 0;
 
     recomputePoints[recomputeCount] = pointCount;
-
+    log_info("Find Anchors profile=" << (calibrationBootstrap17 ? "bootstrap17" : "precision")
+             << " points=" << (pointCount + 1) << " grid=" << gridSize
+             << " range=" << gridWidth << "x" << gridHeight << "mm"
+             << " coarse_step=" << coarseStepX << "," << coarseStepY << "mm"
+             << " repeatability=" << (calibrationBootstrap17 ? BOOTSTRAP17_REPEATABILITY_MM : 2.5)
+             << "mm rms_limit=" << (calibrationBootstrap17 ? BOOTSTRAP17_RMS_LIMIT_MM : FITNESS_RMS_FAIL_MM)
+             << "mm max_limit=" << (calibrationBootstrap17 ? BOOTSTRAP17_MAX_RESIDUAL_MM : FITNESS_MAX_RES_FAIL_MM) << "mm");
     return true;
 }
 
@@ -2432,6 +2900,7 @@ bool Calibration::generate_calibration_grid() {
 * Uses the algorithm described in https://math.stackexchange.com/questions/5013127/find-square-size-from-inscribed-triangles?noredirect=1#comment10752043_5013127 for calculating square size from distances to vertices
 */
 bool Calibration::adjustFrameSizeToMatchFirstMeasurement() {
+    const auto& measurements = measurementState.samples;
     //Get the last measurements
     double tlLen = measurements[0][0];  // distance to A (top-left)
     double trLen = measurements[0][1];  // distance to B (top-right)
@@ -2442,7 +2911,7 @@ bool Calibration::adjustFrameSizeToMatchFirstMeasurement() {
     // The algorithm works for any interior point E inside the square
     double L = SquareCalculation::calculateSquareSideLength(tlLen, trLen, blLen, brLen);
 
-    if (L < 500.0 || L > 5500.0) {  // Sanity check on square size
+    if (!std::isfinite(L) || L < 500.0 || L > 5500.0) {  // Sanity check on square size
         log_error("Unable to adjust frame size. Calculated size " << L << "mm is outside reasonable range");
         return false;
     }
@@ -2519,12 +2988,12 @@ int Calibration::get_direction(double x, double y, double targetX, double target
 // Function to allocate memory for calibration arrays
 void Calibration::allocateCalibrationMemory() {
     if (calibrationGrid == nullptr) {  //Check to prevent realocating
-        calibrationGrid = new float[CALIBRATION_GRID_SIZE_MAX][2];
+        calibrationGrid = new float[CALIBRATION_GRID_SIZE_MAX][2]{};
     }
     if (calibration_data == nullptr) {
-        calibration_data = new float*[CALIBRATION_GRID_SIZE_MAX];
+        calibration_data = new float*[CALIBRATION_GRID_SIZE_MAX]{};
         for (int i = 0; i < CALIBRATION_GRID_SIZE_MAX; ++i) {
-            calibration_data[i] = new float[4];
+            calibration_data[i] = new float[4]{};
         }
     }
 }
@@ -2533,15 +3002,34 @@ void Calibration::allocateCalibrationMemory() {
 void Calibration::deallocateCalibrationMemory() {
     delete[] calibrationGrid;
     calibrationGrid = nullptr;
-    for (int i = 0; i < CALIBRATION_GRID_SIZE_MAX; ++i) {
-        delete[] calibration_data[i];
+    if (calibration_data != nullptr) {
+        for (int i = 0; i < CALIBRATION_GRID_SIZE_MAX; ++i) {
+            delete[] calibration_data[i];
+        }
+        delete[] calibration_data;
+        calibration_data = nullptr;
     }
-    delete[] calibration_data;
-    calibration_data = nullptr;
+}
+
+void Calibration::resetMeasurementState() {
+    measurementState = MeasurementState{};
+    resetHorizontalSampling();
+    horizontalSamplingReferenceInvalid = false;
+    for (int arm = 0; arm < ARM_COUNT; ++arm) horizontalTight[arm] = false;
+    horizontalInitialTensionComplete = false;
+    horizontalMeasurementFault = false;
+    horizontalHoldConflictStart = 0;
+    orientationDetectionDone = false;
+    orientationDetectTimer = 0;
+    holding = false;
 }
 
 // Function to reset all calibration state variables to initial values
 void Calibration::resetCalibrationState() {
+    Maslow.stopMotors();
+    savedAnchorHoldActive = false;
+    applyTensionRecovery = ApplyTensionRecoveryState{};
+    resetMeasurementState();
     diagnosticPhase = nullptr;
     diagnosticWaypoint = -1;
     for (int arm = _TL; arm < ARM_COUNT; ++arm) horizontalTight[arm] = false;
@@ -2783,6 +3271,13 @@ void Calibration::handleMotorOverides() {
  * Returns true when detection is complete.
  */
 bool Calibration::detectOrientation() {
+    if (calibrationBootstrap17) {
+        if (!orientationDetectionDone) {
+            log_info("Find Anchors bootstrap17: using configured " << (orientation == VERTICAL ? "VERTICAL" : "HORIZONTAL") << " orientation");
+            orientationDetectionDone = true;
+        }
+        return true;
+    }
     const unsigned long STARTUP_DELAY_MS                = 50;    // Delay before starting test to ensure stable starting position
     const unsigned long ORIENTATION_DETECT_DURATION_MS  = 1500;  // Duration in ms to run orientation detection test (1.5 seconds)
     const float         ORIENTATION_DETECT_THRESHOLD_MM = 35.0;  // Minimum extension in mm to detect vertical orientation
@@ -2790,7 +3285,7 @@ bool Calibration::detectOrientation() {
     const unsigned long MOTOR_SETTLING_PAUSE_MS         = 500;   // Pause duration after retraction to allow motors to settle
 
     // Track whether the settling pause has completed
-    static bool settlingCompleted = false;
+    bool& settlingCompleted = measurementState.settlingCompleted;
 
     // If settling has already completed, return true immediately on subsequent calls
     // This prevents re-running detection on subsequent calibration_loop iterations
@@ -2881,7 +3376,7 @@ bool Calibration::detectOrientation() {
         if (fabs(tlCurrentPosition - tlStartPosition) < 5.0 && fabs(trCurrentPosition - trStartPosition) < 5.0) {
             // Phase 5: Power down all motors and pause to allow settling
             // This prevents current spikes when immediately trying to pull belts tight in horizontal orientation
-            static unsigned long settlingStartTime = 0;
+            unsigned long& settlingStartTime = measurementState.settlingStart;
 
             // Initialize settling timer on first entry to this phase
             if (settlingStartTime == 0) {

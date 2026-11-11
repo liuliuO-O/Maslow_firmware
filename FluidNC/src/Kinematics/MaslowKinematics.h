@@ -52,7 +52,7 @@ namespace Kinematics {
         ~MaslowKinematics();
 
         // Public access to compute functions for calibration system
-        float compute(int arm, float x, float y, float z);
+        double compute(int arm, double x, double y, double z) const;
         // Deprecated: Use compute(arm, x, y, z) instead
         float computeTL(float x, float y, float z) { return compute(_TL, x, y, z); }
         float computeTR(float x, float y, float z) { return compute(_TR, x, y, z); }

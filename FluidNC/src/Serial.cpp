@@ -280,8 +280,27 @@ size_t AllChannels::write(const uint8_t* buffer, size_t length) {
 Channel* AllChannels::pollLine(char* line) {
     Channel* deadChannel;
     while (xQueueReceive(_killQueue, &deadChannel, 0)) {
+        // Ignore repeated/stale kill records. Detach first so no new command
+        // or broadcast can select the channel while retirement is pending.
+        _mutex.lock();
+        const bool registered = std::find(_channelq.begin(), _channelq.end(), deadChannel) != _channelq.end();
+        _mutex.unlock();
+        if (!registered) {
+            continue;
+        }
         deregistration(deadChannel);
-        delete deadChannel;
+        _retiringChannels.push_back(deadChannel);
+    }
+    for (auto it = _retiringChannels.begin(); it != _retiringChannels.end();) {
+        if (*it == activeChannel.load(std::memory_order_acquire)) {
+            ++it;  // execute_line()/ack() still owns this object.
+            continue;
+        }
+        // Also wait for output already dequeued on the other core. Otherwise
+        // queued "ok" can call a pure virtual function after channel destruction.
+        drain_messages();
+        delete *it;
+        it = _retiringChannels.erase(it);
     }
 
     // To avoid starving other channels when one has a lot

@@ -8,6 +8,7 @@
 #include "Arduino.h"
 #include "Wire.h"
 #include "AS5600.h"
+#include "CalibrationHoldController.h"
 #include "MiniPID.h"  //https://github.com/tekdemo/MiniPID
 #include "DCMotor.h"
 #include "memory"
@@ -30,9 +31,18 @@ public:
     double   getCurrent();
     double   getPositionError();
     void     stop();
+    void     driveIn(int pwm);
     bool     updateEncoderPosition();
     uint32_t getEncoderReadFailures() const { return encoderReadFailures; }
+    // Lifetime counter; observing it does not filter or modify cumulative position.
+    uint32_t getEncoderLargeSteps() const { return encoderLargeSteps; }
+    bool hasFreshEncoderFeedback(uint32_t now) const {
+        return encoderSampleSequence != 0 && now - encoderSampleMillis <= MaslowCalibrationHold::maxFeedbackGapMs;
+    }
     double   recomputePID();
+    bool     recomputeMotionPID();
+    bool     recomputeCalibrationHold();
+    double   getCalibrationHoldVelocity() const { return calibrationHold.velocity(); }
     void     decompressBelt();
     void     driveOut(int speed);  // Drive motor outward at specified PWM speed (0-1023)
     bool     comply();
@@ -53,6 +63,12 @@ public:
     bool   onTarget(double precision);
 
 private:
+    MaslowCalibrationHold::Controller calibrationHold;
+    uint32_t encoderSampleSequence = 0;
+    uint32_t encoderSampleMillis = 0;
+    uint32_t calibrationHoldSequence = 0;
+    uint32_t motionPIDSequence = 0;
+    uint32_t encoderLargeSteps = 0;
     uint32_t encoderReadFailures = 0;  // Cumulative since boot, including mux selection failures.
     bool     encoderDiagnosticInitialized = false;
     int32_t  encoderDiagnosticLastCounts = 0;

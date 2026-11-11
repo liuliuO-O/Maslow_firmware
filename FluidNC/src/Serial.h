@@ -72,6 +72,7 @@ Channel* pollChannels(char* line = nullptr);
 
 class AllChannels : public Channel {
     std::vector<Channel*> _channelq;
+    std::vector<Channel*> _retiringChannels;  // Detached, awaiting command/output completion.
 
     Channel*     _lastChannel = nullptr;
     xQueueHandle _killQueue;

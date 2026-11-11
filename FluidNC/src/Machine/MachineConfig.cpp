@@ -96,6 +96,7 @@ namespace Machine {
 
     void MachineConfig::groupM4Items(Configuration::HandlerBase& handler) {
         handler.item(M + "_vertical", Maslow.calibration.orientation);
+        handler.item(M + "_calibration_bootstrap17", Maslow.calibration.calibrationBootstrap17);
         handler.item(M + "_calibration_grid_width_mm_X", Maslow.calibration.calibration_grid_width_mm_X, 0, 3000);
         handler.item(M + "_calibration_grid_height_mm_Y", Maslow.calibration.calibration_grid_height_mm_Y, 0, 3000);
         handler.item(M + "_calibration_grid_size", Maslow.calibration.calibrationGridSize, 3, 9);
@@ -104,8 +105,10 @@ namespace Machine {
         handler.item(M + "_Acceptable_Calibration_Threshold", Maslow.calibration.acceptableCalibrationThreshold, 0, 1);
         handler.item(M + "_Apply_Tension_Belt_Retraction_Limit", Maslow.calibration.applyTensionBeltRetractionLimitMm, 0.0, 4250.0);
         handler.item(M + "_Apply_Tension_Allow_Limiting", Maslow.calibration.applyTensionAllowLimiting);
+        handler.item(M + "_Apply_Tension_Max_Residual_Mm", Maslow.calibration.applyTensionMaxResidualMm, 0.5, 5.0);
         handler.item(M + "_Extend_Dist", Maslow.calibration.extendDist, 0, 4250);
 
+        handler.item(M + "_Jog_Max_Feed", Maslow.jogMaxFeed, 1.0f, 10000.0f);
         handler.item(M + "_Scale_X", Maslow.scaleX, .8, 1.2);
         handler.item(M + "_Scale_Y", Maslow.scaleY, .8, 1.2);
         handler.item(M + "_debugEnabled", Maslow.debugEnabled);
@@ -218,7 +221,7 @@ namespace Machine {
     // Default Config - Board
     const std::string dcBoard = "name: Default (" + M + " S3 Board)\nboard: " + M + "\n";
 
-    const std::string dcM4Vert            = M + "_vertical: false\n";
+    const std::string dcM4Vert            = M + "_vertical: false\n" + M + "_calibration_bootstrap17: true\n";
     const std::string dcM4CalibrationGrid = mcgrid + "width_mm_X: 0\n" + mcgrid + "height_mm_Y: 0\n" + mcgrid + "size: 9\n";
 
     const std::string dcM4Anchors = M + "_tlX: -27.6\n" + M + "_tlY: 2064.9\n" + M + "_trX: 2924.3\n" + M + "_trY: 2066.5\n" + M +
@@ -283,6 +286,7 @@ namespace Machine {
         // If the system crashes we skip the config file and use the default
         // builtin config.  This helps prevent reset loops on bad config files.
         esp_reset_reason_t reason = esp_reset_reason();
+        log_info("ESP32 reset reason: " << static_cast<int>(reason));
 
         // TEST: Uncomment the following to mock an ESP panic reset
         //reason = ESP_RST_PANIC;

@@ -83,6 +83,12 @@ void DCMotor::halfIn() {
  *  @param speed The speed the motor should spin (-1023 to 1023)
  */
 void DCMotor::runAtPWM(long signed_speed) {
+    // Zero effort must not become a positive 75-PWM drive command.
+    if (signed_speed == 0) {
+        runAtPWMDirect(0);
+        return;
+    }
+    signed_speed = signed_speed < -1023 ? -1023 : signed_speed > 1023 ? 1023 : signed_speed;
     //Motor driver accepts -maxPWMvalue to maxPWMvalue but doesn't begin moving until motorStartsToMovePWM so we scale
 
     int  motorStartsToMovePWM = 75;
@@ -102,6 +108,13 @@ void DCMotor::runAtPWM(long signed_speed) {
  *  @param  direction Direction backward (0) or forward (1, or ~0)
  *  @param speed The pwm frequency sent to the motor (0-1023)
  */
+// PWM-mode equal-high inputs apply dynamic braking (DRV8873 Table 5).
+// stop()/highZ() retain their existing equal-low output for emergency/off states.
+void DCMotor::runAtPWMDirect(long signed_speed) {
+    signed_speed = signed_speed < -1023 ? -1023 : signed_speed > 1023 ? 1023 : signed_speed;
+    runAtSpeed(signed_speed < 0 ? BACKWARD : FORWARD, static_cast<uint16_t>(abs(signed_speed)));
+}
+
 void DCMotor::runAtSpeed(uint8_t direction, uint16_t speed) {
     if (direction == 0) {
         ledcWrite(_channel1, _maxSpeed);

@@ -1,3 +1,5 @@
+import os
+from test_calibration_bootstrap import compiler_command
 """Host-side logging-only tests using the diagnostic methods extracted from production C++."""
 from pathlib import Path
 import shutil
@@ -8,13 +10,13 @@ import unittest
 
 class CalibrationDiagnosticsTest(unittest.TestCase):
     def test_logging_does_not_control_motion(self):
-        compiler = shutil.which('c++')
+        compiler = compiler_command(Path(__file__).resolve().parents[3])
         self.assertIsNotNone(compiler, 'A host C++ compiler is required')
         root = Path(__file__).resolve().parents[2]
-        source = (root / 'src/Maslow/Calibration.cpp').read_text()
+        source = (root / 'src/Maslow/Calibration.cpp').read_text(encoding='utf-8-sig')
         methods = source[source.index('void Calibration::diagnosticStage('):
                          source.index('// -Maslow homing loop.')]
-        header = (root / 'src/Maslow/Calibration.h').read_text()
+        header = (root / 'src/Maslow/Calibration.h').read_text(encoding='utf-8-sig')
         fields = header[header.index('    void diagnosticStage('):
                         header.index('    //Variables used for retracting state')]
         harness = r'''
@@ -74,9 +76,9 @@ int main() {
 '''.replace('FIELDS', fields).replace('METHODS', methods)
         with tempfile.TemporaryDirectory() as directory:
             cpp = Path(directory) / 'test.cpp'
-            binary = Path(directory) / 'test'
-            cpp.write_text(harness)
-            subprocess.run([compiler, '-std=c++11', str(cpp), '-o', str(binary)], check=True)
+            binary = Path(directory) / ('test.exe' if os.name == 'nt' else 'test')
+            cpp.write_text(harness, encoding='utf-8')
+            subprocess.run(compiler + ['-std=c++11', str(cpp), '-o', str(binary)], check=True)
             subprocess.run([str(binary)], check=True)
 
 

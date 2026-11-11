@@ -33,6 +33,7 @@ public:
     void   halfIn();
     void   runAtSpeed(uint8_t direction, uint16_t speed);
     void   runAtPWM(long signed_speed);
+    void   runAtPWMDirect(long signed_speed);  // Effective duty: no minimum-speed boost.
     void   stop();
     void   highZ();
     double readCurrent();

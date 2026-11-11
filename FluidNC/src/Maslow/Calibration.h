@@ -1,6 +1,9 @@
 #pragma once
 #include <Arduino.h>
 #include "MaslowEnums.h"
+#include "CalibrationStabilityWindow.h"
+#include "SavedAnchorRecovery.h"
+#include "CalibrationHoldController.h"
 
 class Calibration {
 public:
@@ -38,6 +41,10 @@ public:
     float measurementToXYPlane(float measurement, float zHeight);
     float measurementFromXYPlane(float xyPlaneDistance, float zHeight);
     bool  takeSlackFunc();
+    bool  maintainSavedAnchorHold();
+    bool  beginSavedAnchorMotionSettling();
+    bool  savedAnchorMotionSettling() const { return savedAnchorHoldActive && applyTensionRecovery.motionSettling; }
+    void  cancelSavedAnchorHold() { savedAnchorHoldActive = false; }
     bool  adjustFrameSizeToMatchFirstMeasurement();
     bool  computeXYfromLengths(double TL, double TR, float& x, float& y);
     void  calibration_loop();
@@ -77,15 +84,18 @@ public:
     float extendDist = 1700;
 
     //Variables used by calibration
-    bool  orientation;
+    bool  orientation = HORIZONTAL;
     float acceptableCalibrationThreshold = 0.5;
     float applyTensionBeltRetractionLimitMm = 300.0;
     bool  applyTensionAllowLimiting         = true;
+    float applyTensionMaxResidualMm          = 2.5f;
+    // First establish anchors with 17 samples; disable for the original precision/grid policy.
+    bool  calibrationBootstrap17         = true;
     int   calibrationGridSize            = 9;
     float calibration_grid_width_mm_X    = 0;      // mm grid width (0 = auto-calculate as 50% of frame width)
     float calibration_grid_height_mm_Y   = 0;      // mm grid height (0 = auto-calculate as 20% of frame height)
     float calibrationMaxSpacingMm        = 260.0;  // Maximum allowed spacing between calibration points when auto-selecting grid size
-    bool  calibrationInProgress;                   //Used to turn off regular movements during calibration
+    bool  calibrationInProgress = false;                   //Used to turn off regular movements during calibration
 
     //State machine variables
     int currentState = UNKNOWN;
@@ -110,6 +120,40 @@ private:
     //Variables used for retracting state
     bool axis_homed[4]         = { false, false, false, false };
     bool retracting[ARM_COUNT] = { false, false, false, false };
+
+    // An Apply Tension run owns its own references, timing and samples.
+    // Find Anchors retains a separate acquisition path and fit policy.
+    struct ApplyTensionRecoveryState {
+        bool active = false;
+        bool sampling = false;
+        bool preloadResponding[ARM_COUNT] = {};
+        MaslowSavedAnchorRecovery::PreloadDrive preload[ARM_COUNT];
+        uint32_t started = 0, samplingStarted = 0, lastDiagnostic = 0, lastPreloadUpdate = 0;
+        uint32_t holdConflictStarted = 0;
+        bool holdConflict = false;
+        bool motionSettling = false, motionWithinTolerance = false;
+        uint32_t motionSettlingStarted = 0, motionWithinToleranceSince = 0;
+        uint32_t longestMotionWithinToleranceMs = 0;
+        double motionPeakError[ARM_COUNT] = {};
+        unsigned motionOutsideToleranceMask = 0;
+        unsigned samplePositionMask = 0, samplePwmMask = 0;
+        MaslowCalibrationStability::Diagnostics sampleDiagnostics;
+        float startLength[ARM_COUNT] = {};
+        uint32_t readFailures[ARM_COUNT] = {};
+        uint32_t largeSteps[ARM_COUNT] = {};
+        int snapshots = 0, replacements = 0;
+        float retained[4][ARM_COUNT] = {};
+        MaslowCalibrationStability::Window stability;
+    } applyTensionRecovery;
+    bool savedAnchorHoldActive = false;
+    bool beginApplyTension();
+    bool failApplyTension(const char* reason, bool referenceInvalid);
+    bool applyTensionFeedbackHealthy(uint32_t now);
+    bool savedAnchorHoldSettled();
+    bool keepSettledSavedAnchorHold();
+    bool updateApplyTensionHold(uint32_t now);
+    void logSavedAnchorSettling(const char* result, uint32_t now) const;
+    void logSavedAnchorSampling(const char* result) const;
 
     // Store the previous state before entering RELEASE_TENSION
     int previousState = UNKNOWN;
@@ -136,6 +180,46 @@ private:
     // Fitness tracking across recomputes
     double previousFitnessRms  = -1.0;  // RMS from prior recompute; -1.0 = no prior recompute
     bool   lastRecomputePassed = false;  // Set true only when all fitness gates pass
+
+    // State belongs to a run, not to function statics: abort/retry must start clean.
+    struct MeasurementState {
+        int run = 0;
+        int retries = 0;
+        float samples[4][4] = {};
+        bool bottomLeftTight = false;
+        bool bottomRightTight = false;
+        bool pull1Tight = false;
+        bool pull2Tight = false;
+        unsigned long moveBegin = 0;
+        unsigned long moveLastUpdate = 0;
+        double moveElapsedMs = 0;
+        double moveBeltOffset[ARM_COUNT] = {};
+        bool moveNeedsInit = true;
+        int moveDirection = UP;
+        float xStep = 0, yStep = 0;
+        bool tlExtending = false, trExtending = false;
+        bool blExtending = false, brExtending = false;
+        unsigned long stabilizeTimer = 0;
+        bool settlingCompleted = false;
+        unsigned long settlingStart = 0;
+    } measurementState;
+    bool moveCalibratedHorizontal(double fromX, double fromY, double toX, double toY);
+    void finishCalibrationMove(int direction);
+    void resetMeasurementState();
+    void resetHorizontalSampling();
+    bool failHorizontalSampling(const char* reason);
+    bool takeStableHorizontalMeasurement(float result[4], int current, int point);
+    struct HorizontalSamplingState {
+        int point = -1;
+        int firstBottom = _BR;
+        bool holdingSamples = false;
+        unsigned long phaseStarted = 0;
+        uint32_t readFailures[ARM_COUNT] = {};
+        uint32_t largeSteps[ARM_COUNT] = {};
+        MaslowCalibrationStability::Window stability;
+    } horizontalSampling;
+    bool horizontalSamplingReferenceInvalid = false;
+    float coarseStepX = 150.0f, coarseStepY = 150.0f;
 
     //Used to keep track of how often the PID controller is updated
     unsigned long lastCallToPID    = millis();

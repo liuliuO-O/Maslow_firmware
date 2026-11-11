@@ -145,9 +145,12 @@ bool MotorUnit::updateEncoderPosition() {
 
     mostRecentCumulativeEncoderReading = cumulativeCounts;
     const unsigned long now = millis();
+    encoderSampleMillis = static_cast<uint32_t>(now);
+    ++encoderSampleSequence;
     if (encoderDiagnosticInitialized) {
         const int32_t countDelta = cumulativeCounts - encoderDiagnosticLastCounts;
         if (abs(countDelta) > 1536) {
+            ++encoderLargeSteps;
             ++encoderDiagnosticSuppressed;
             if (now - encoderDiagnosticLastPrintTime >= 250) {
                 // These extra I2C reads are diagnostic only.  Keep them out of
@@ -202,6 +205,7 @@ double MotorUnit::getPositionError() {
 
 // Recomputes the PID and drives the output
 double MotorUnit::recomputePID() {
+    calibrationHold.reset();
     _commandPWM = positionPID.getOutput(getPosition(), setpoint);
 
     motor.runAtPWM(_commandPWM);
@@ -209,9 +213,43 @@ double MotorUnit::recomputePID() {
     return _commandPWM;
 }
 
+// Use encoder-paced position feedback with the existing continuous friction compensation.
+bool MotorUnit::recomputeMotionPID() {
+    const double position = getPosition();
+    if (!hasFreshEncoderFeedback(static_cast<uint32_t>(millis())) || !std::isfinite(position) || !std::isfinite(setpoint)) {
+        stop();
+        return false;
+    }
+    if (motionPIDSequence == encoderSampleSequence) return true;
+
+    motionPIDSequence = encoderSampleSequence;
+    calibrationHold.reset();
+    const double effort = positionPID.getOutput(position, setpoint);
+    _commandPWM = std::lround(MaslowCalibrationHold::Controller::driveForEffort(effort, 1023.0));
+    motor.runAtPWMDirect(static_cast<long>(_commandPWM));
+    return true;
+}
+
 //------------------------------------------------------
 //------------------------------------------------------ Homing/calibration functions
 //------------------------------------------------------
+
+bool MotorUnit::recomputeCalibrationHold() {
+    if (!hasFreshEncoderFeedback(static_cast<uint32_t>(millis()))) {
+        stop();
+        return false;
+    }
+    if (calibrationHold.active() && calibrationHoldSequence == encoderSampleSequence) return true;
+
+    if (!calibrationHold.update(encoderSampleMillis, getPosition(), setpoint)) {
+        stop();
+        return false;
+    }
+    calibrationHoldSequence = encoderSampleSequence;
+    _commandPWM = std::lround(calibrationHold.output());
+    motor.runAtPWMDirect(static_cast<long>(_commandPWM));
+    return true;
+}
 
 // Sets the motor to comply with how it is being pulled, non-blocking.
 bool MotorUnit::comply() {
@@ -360,8 +398,16 @@ double MotorUnit::getCurrent() {
 
 // Stops the motor
 void MotorUnit::stop() {
+    calibrationHoldSequence = 0;
+    motionPIDSequence = 0;
+    calibrationHold.reset();
     motor.stop();
     _commandPWM = 0;
+}
+
+void MotorUnit::driveIn(int pwm) {
+    _commandPWM = -pwm;
+    motor.runAtPWMDirect(-pwm);
 }
 
 // Returns the PWM values set to the motor
@@ -429,6 +475,9 @@ void MotorUnit::reset() {
 // Resets PID state to clear any accumulated integral term.
 // Call this after a hard stop to prevent residual I-term motion.
 void MotorUnit::resetPID() {
+    calibrationHoldSequence = 0;
+    motionPIDSequence = 0;
+    calibrationHold.reset();
     positionPID.reset();
 }
 

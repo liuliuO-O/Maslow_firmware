@@ -1646,6 +1646,9 @@ Error gc_execute_line(char* line) {
             break;
         case ProgramFlow::Paused:
             protocol_buffer_synchronize();  // Sync and finish all remaining buffered motions before moving on.
+            if (sys.abort()) {
+                return Error::SystemGcLock;
+            }
             if (sys.state() != State::CheckMode) {
                 protocol_send_event(&feedHoldEvent);
                 protocol_execute_realtime();  // Execute suspend.
@@ -1654,6 +1657,10 @@ Error gc_execute_line(char* line) {
         case ProgramFlow::CompletedM2:
         case ProgramFlow::CompletedM30:
             protocol_buffer_synchronize();  // Sync and finish all remaining buffered motions before moving on.
+            if (sys.abort()) {
+                // A cancelled job must not report Program End or run its end hook.
+                return Error::SystemGcLock;
+            }
 
             // Upon program complete, only a subset of g-codes reset to certain defaults, according to
             // LinuxCNC's program end descriptions and testing. Only modal groups [G-code 1,2,3,5,7,12]

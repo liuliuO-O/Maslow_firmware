@@ -6,6 +6,7 @@
 #include "../Report.h"
 #include "../WebUI/WifiConfig.h"
 #include "../Protocol.h"
+#include "../MotionControl.h"
 #include "../System.h"
 #include "../Stepper.h"
 #include "../FileStream.h"
@@ -23,11 +24,11 @@ extern const char* VERSION_NUMBER;
 #define BLEncoderLine 3
 #define BREncoderLine 0
 
-// Normal physical mapping: TL/TR motor and encoder plugs are connected to their
-// matching mainboard ports. Toggle an encoder flag below to reverse its readings
-// without changing motor direction. Only BR currently needs software reversal.
-static constexpr bool tlEncoderReversed = false;
-static constexpr bool trEncoderReversed = false;
+// Motor and encoder plugs use their matching mainboard ports. Each flag below
+// reverses that encoder reading independently, without changing motor direction.
+static constexpr bool tlEncoderReversed = true;
+static constexpr bool trEncoderReversed = true;
+static constexpr bool blEncoderReversed = true;
 static constexpr bool brEncoderReversed = true;
 
 #define motorPWMFreq 2000
@@ -78,12 +79,22 @@ static constexpr uint32_t ENCODER_READ_FREQUENCY_HZ = 250;
 
 // Initialization function
 void Maslow_::begin(void (*sys_rt)()) {
+    // protocol_main_loop() calls begin again after a protocol abort. Hardware
+    // initialization zeros encoders and pulses each motor, so it is power-on
+    // work only, including when the first initialization reports a fault.
+    static bool initialized = false;
+    if (initialized) {
+        resetUpdateWatchdog();
+        return;
+    }
+    initialized = true;
+
     Wire.begin(5, 4, 200000);
     I2CMux.begin(TCAADDR, Wire);
 
     axis[_TL].begin(tlIn1Pin, tlIn2Pin, tlADCPin, TLEncoderLine, tlIn1Channel, tlIn2Channel, tlEncoderReversed);
     axis[_TR].begin(trIn1Pin, trIn2Pin, trADCPin, TREncoderLine, trIn1Channel, trIn2Channel, trEncoderReversed);
-    axis[_BL].begin(blIn1Pin, blIn2Pin, blADCPin, BLEncoderLine, blIn1Channel, blIn2Channel);
+    axis[_BL].begin(blIn1Pin, blIn2Pin, blADCPin, BLEncoderLine, blIn1Channel, blIn2Channel, blEncoderReversed);
     axis[_BR].begin(brIn1Pin, brIn2Pin, brADCPin, BREncoderLine, brIn1Channel, brIn2Channel, brEncoderReversed);
 
     calibration.axisHomed[_BL] = false;
@@ -123,6 +134,7 @@ void Maslow_::begin(void (*sys_rt)()) {
         log_error(M + " failed to initialize - fix errors and restart");
     } else {
         log_info("Starting " + M + " Version " << VERSION_NUMBER);
+        log_info("Maslow motion profile=jog-fit-r1 XY_jog_max_mm_min=" << jogMaxFeed << " diagnostics=motion-trace-r1");
         log_info("Maslow_Retract_Current_Threshold: " << calibration.retractCurrentThreshold);
     }
 }
@@ -194,16 +206,6 @@ void Maslow_::update() {
         digitalWrite(ETHERNETLEDPIN, HIGH);
     }
 
-    //Save the z-axis position if the prevous state was jog or cycle and the current state is idle
-    if ((prevState == State::Jog || prevState == State::Cycle) && sys.state() == State::Idle) {
-        saveZPos();
-        // Only save belt positions when in READY_TO_CUT, RETRACTED, or EXTENDEDOUT state (belts are tight and valid)
-        int currentMaslowState = calibration.getCurrentState();
-        if (currentMaslowState == READY_TO_CUT || currentMaslowState == RETRACTED || currentMaslowState == EXTENDEDOUT) {
-            saveBeltPositions();
-        }
-    }
-
     // Track state changes and mark belt positions as stale when leaving valid states
     static int prevMaslowState    = calibration.getCurrentState();
     int        currentMaslowState = calibration.getCurrentState();
@@ -255,9 +257,23 @@ void Maslow_::update() {
         }
 
         //------------------------ Maslow State Machine
+        const State motionState = sys.state();
+        // Complete the final belt targets before handing off to the idle hold.
+        if ((prevState == State::Jog || prevState == State::Cycle) && motionState == State::Idle) {
+            if (calibration.beginSavedAnchorMotionSettling()) {
+                // The final step may have landed after the last motion update.
+                for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+                    axis[arm].setTarget(steps_to_mpos(get_axis_motor_steps(arm), arm));
+                }
+            } else {
+                saveZPos();
+                saveBeltPositions();
+            }
+        }
+        prevState = motionState;
 
         //-------Jog or G-code execution.
-        if (sys.state() == State::Jog || sys.state() == State::Cycle || sys.state() == State::Hold) {
+        if (motionState == State::Jog || motionState == State::Cycle || motionState == State::Hold) {
             // With MaslowKinematics, read belt motor positions directly from the axis system
             // Axis mapping: A=TL, B=TR, C=BL, D=BR, Z=Router
             float beltLength[ARM_COUNT];
@@ -300,7 +316,9 @@ void Maslow_::update() {
         } else {  //This is confusing to understand. This is an else if so this is only run if we are not in jog, cycle, or homing
             // Clear any motor override flags to ensure motors stop
             calibration.clearMotorOverrides();
-            Maslow.stopMotors();
+            if (sys.state() != State::Idle || !calibration.maintainSavedAnchorHold()) {
+                Maslow.stopMotors();
+            }
         }
 
         //If we are in any state other than idle or alarm turn the cooling fan on
@@ -320,7 +338,6 @@ void Maslow_::update() {
         print_motor_currents();
     }
 
-    prevState = sys.state();  //Store for next time
 }
 
 //------------------------------------------------------
@@ -420,10 +437,19 @@ double Maslow_::getTargetZ() {
 
 //updates motor powers for all axis, based on targets set by setTargets()
 void Maslow_::recomputePID() {
-    axis[_BL].recomputePID();
-    axis[_BR].recomputePID();
-    axis[_TR].recomputePID();
-    axis[_TL].recomputePID();
+    const auto now = static_cast<uint32_t>(millis());
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if (!axis[arm].hasFreshEncoderFeedback(now)) {
+            eStop("Encoder feedback stale during belt tracking");
+            return;
+        }
+    }
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        if (!axis[arm].recomputeMotionPID()) {
+            eStop("Invalid encoder sample or target during belt tracking");
+            return;
+        }
+    }
 
     digitalWrite(coolingFanPin, HIGH);  //keep the cooling fan on
 
@@ -1062,13 +1088,33 @@ void Maslow_::blinkIPAddress() {
 
 //Print the motor currents. Used for monitioring the power consumption of each motor.
 void Maslow_::print_motor_currents() {
-    if (!debugEnabled) {
-        return;
-    }
+    const bool jogging = sys.state() == State::Jog && calibration.currentState == READY_TO_CUT;
+    const bool settling = calibration.savedAnchorMotionSettling();
+    if (!debugEnabled && !jogging && !settling) return;
 
     static unsigned long lastExecutionTime = 0;
-    unsigned long        currentTime       = millis();
+    const unsigned long currentTime = millis();
 
+    // Keep the original current report for diagnostics outside Ready/recovery.
+    if (calibration.currentState == READY_TO_CUT || calibration.currentState == TAKING_SLACK) {
+        if (currentTime - lastExecutionTime >= 100 && atMsgLevel(MsgLevelInfo)) {
+            lastExecutionTime = currentTime;
+            LogStream line("[MSG:INFO: BELT_TRACK ");
+            const char* phase = jogging ? "jog" : settling ? "settling"
+                                       : calibration.currentState == TAKING_SLACK ? "tension" : "ready";
+            line << "ms=" << static_cast<unsigned int>(currentTime) << " state=" << static_cast<int>(sys.state())
+                 << " phase=" << phase << " columns=target_mm,actual_mm,actual_mm_s,pwm,adc,read_fail,large_steps";
+            const char* labels[ARM_COUNT] = { " TL=", " TR=", " BL=", " BR=" };
+            for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+                auto& belt = axis[arm];
+                line << labels[arm] << belt.getTarget() << ',' << belt.getPosition()
+                     << ',' << belt.getBeltSpeed() << ',' << belt.getMotorPower() << ',' << belt.getMotorCurrent()
+                     << ',' << static_cast<unsigned>(belt.getEncoderReadFailures())
+                     << ',' << static_cast<unsigned>(belt.getEncoderLargeSteps());
+            }
+        }
+        return;
+    }
     if (currentTime - lastExecutionTime >= 1000) {
         log_info("TLC: " << axis[_TL].getMotorCurrent() << " TRC: " << axis[_TR].getMotorCurrent()
                          << " BLC: " << axis[_BL].getMotorCurrent() << " BRC: " << axis[_BR].getMotorCurrent());
@@ -1104,6 +1150,7 @@ void Maslow_::stop() {
 
 // Stop all the motors
 void Maslow_::stopMotors() {
+    calibration.cancelSavedAnchorHold();
     axis[_BL].stop();
     axis[_BR].stop();
     axis[_TR].stop();
@@ -1172,15 +1219,22 @@ void Maslow_::raiseZ() {
 }
 
 static void stopEverything() {
+    // Stop physical outputs and request the protocol abort before logging or
+    // file cleanup can block. mc_reset() must still see the original motion
+    // state so it stops the step generator as well as cancelling the planner.
+    Maslow.stopMotors();
+    mc_reset();
     sys.set_state(State::Alarm);
-    protocol_disable_steppers();
+    // stop_stepping() clears the current pulse; go_idle() also prevents the
+    // interrupt from consuming another queued segment while cleanup runs.
+    Stepper::go_idle();
 }
 
 // Panic function, stops all motors and sets state to alarm
 void Maslow_::panic() {
     panicCount++;
-    stop();
     stopEverything();
+    stop();
 }
 
 // Reset the update watchdog timer to prevent false emergency stops during
@@ -1227,12 +1281,12 @@ bool Maslow_::clearError() {
 
 //Emergency Stop
 void Maslow_::eStop(String message) {
-    log_error("Emergency stop! Stopping all motors");
-    log_warn("The machine will not respond until turned off and back on again");
-    stop();
+    stopEverything();
     error        = true;
     errorMessage = message;
-    stopEverything();
+    stop();
+    log_error("Emergency stop! Stopping all motors");
+    log_warn("Emergency stop latched. Check the cause, belt tension and machine position before unlocking.");
 }
 
 //This is the function that should prevent machine from damaging itself
@@ -1244,7 +1298,8 @@ void Maslow_::safety_control() {
     static int           panicCounter[4]         = { 0 };
 
     static int   positionErrorCounter[4]  = { 0 };
-    static float previousPositionError[4] = { 0, 0, 0, 0 };
+    constexpr int encoderLines[ARM_COUNT] = { TLEncoderLine, TREncoderLine, BLEncoderLine, BREncoderLine };
+    const bool moving = sys.state() == State::Jog || sys.state() == State::Cycle;
 
     for (int i = 0; i < 4; i++) {
         //If the current exceeds some absolute value, we need to call panic() and stop the machine
@@ -1291,15 +1346,13 @@ void Maslow_::safety_control() {
         }
 
         //If the motor has a position error greater than 15mm and we are running a file or jogging
-        previousPositionError[i] = axis[i].getPositionError();
-        if ((abs(axis[i].getPositionError()) > 15) && (sys.state() == State::Cycle)) {
-            positionErrorCounter[i]++;
-            log_warn("Position error on " << axis_id_to_label(i).c_str() << " axis exceeded 15mm while running. Error is "
-                                          << axis[i].getPositionError() << "mm" << " Counter: " << positionErrorCounter[i]);
-            log_warn("Previous error was " << previousPositionError[i] << "mm");
-
-            if (positionErrorCounter[i] > 5) {
+        const double errorMm = axis[i].getPositionError();
+        if (moving && std::fabs(errorMm) > 15.0) {
+            if (++positionErrorCounter[i] > 5) {
                 Maslow.eStop("Position error > 15mm while running. E-Stop triggered.");
+                log_warn("Position error on " << axis_id_to_label(encoderLines[i]).c_str()
+                         << " axis exceeded 15mm while running. Error is " << errorMm << "mm");
+                return;
             }
         } else {
             positionErrorCounter[i] = 0;
