@@ -83,6 +83,7 @@ using std::max;
 std::vector<std::string> logs;
 #define log_info(x) do {std::ostringstream s;s<<x;logs.push_back(s.str());}while(false)
 #define log_error(x) log_info(x)
+#define log_debug(x) log_info(x)
 void serviceCalibrationWatchdogs(bool=false){}
 struct Axis {
     double position=1000,target=1000,pwm=0;
@@ -92,6 +93,7 @@ struct Axis {
     double getPosition(){return position;}
     double getTarget(){return target;}
     double getMotorPower(){return pwm;}
+    double getMotorCurrent(){return 0;}
     uint32_t getEncoderReadFailures(){return failures;}
     uint32_t getEncoderLargeSteps(){return steps;}
     void setTarget(double p){target=p;++sets;}
@@ -184,8 +186,15 @@ int main() {
     Calibration invalid;setup(invalid);Maslow.axis[0].position=std::numeric_limits<double>::quiet_NaN();
     assert(!step(invalid,out) && invalid.horizontalMeasurementFault);
     for(auto& a:Maslow.axis)assert(a.pulls==0);
-    Calibration drifting;setup(drifting);prime(drifting,out);Maslow.axis[_TL].position+=2;
+    Calibration drifting;setup(drifting);prime(drifting,out);Maslow.axis[_BR].position+=11.7;
+    logs.clear();
     assert(!step(drifting,out,0,8000) && drifting.horizontalMeasurementFault);
+    assert(logs.size()==1);
+    assert(logs[0].find("第 1 点")!=std::string::npos);
+    assert(logs[0].find("8 秒内未能稳定采样")!=std::string::npos);
+    assert(logs[0].find("右下(BR)")!=std::string::npos);
+    assert(logs[0].find("偏差 11.7 mm，PWM -1023")!=std::string::npos);
+    assert(logs[0].find("电流 0 ADC，读取失败 0")!=std::string::npos);
     Calibration preloadTimeout;setup(preloadTimeout);Maslow.axis[_BL].finishAfter=100000;
     assert(!step(preloadTimeout,out));
     assert(!step(preloadTimeout,out,0,30000) && preloadTimeout.horizontalMeasurementFault);

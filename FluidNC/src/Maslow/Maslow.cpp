@@ -134,7 +134,7 @@ void Maslow_::begin(void (*sys_rt)()) {
         log_error(M + " failed to initialize - fix errors and restart");
     } else {
         log_info("Starting " + M + " Version " << VERSION_NUMBER);
-        log_info("Maslow motion profile=jog-fit-r1 XY_jog_max_mm_min=" << jogMaxFeed << " diagnostics=motion-trace-r1");
+        log_info("Maslow motion profile=jog-fit-r1 XY_jog_max_mm_min=" << jogMaxFeed << " diagnostics=motion-trace-r1 protection=preload-guard-r1");
         log_info("Maslow_Retract_Current_Threshold: " << calibration.retractCurrentThreshold);
     }
 }
@@ -438,25 +438,28 @@ double Maslow_::getTargetZ() {
 //updates motor powers for all axis, based on targets set by setTargets()
 void Maslow_::recomputePID() {
     const auto now = static_cast<uint32_t>(millis());
+    constexpr int encoderLines[ARM_COUNT] = { TLEncoderLine, TREncoderLine, BLEncoderLine, BREncoderLine };
     for (int arm = _TL; arm < ARM_COUNT; ++arm) {
         if (!axis[arm].hasFreshEncoderFeedback(now)) {
-            eStop("Encoder feedback stale during belt tracking");
+            eStop(String("运动跟踪 | 编码器数据过期 | ") + axis_id_to_label(encoderLines[arm]));
             return;
         }
     }
     for (int arm = _TL; arm < ARM_COUNT; ++arm) {
         if (!axis[arm].recomputeMotionPID()) {
-            eStop("Invalid encoder sample or target during belt tracking");
+            eStop(String("运动跟踪 | 编码器读数或目标带长无效 | ") + axis_id_to_label(encoderLines[arm]));
             return;
         }
     }
 
     digitalWrite(coolingFanPin, HIGH);  //keep the cooling fan on
 
-    if (digitalRead(SERVOFAULT) ==
-        1) {  //The servo drives have a fault pin that goes high when there is a fault (ie one over heats). We should probably call panic here. Also this should probably be read in the main loop
-        log_info("Servo fault!");
+    static bool driveFaultActive = false;
+    const bool driveFault = digitalRead(SERVOFAULT) == 1;
+    if (driveFault && !driveFaultActive) {
+        log_warn("运动 | 驱动器故障信号触发（公共信号）");
     }
+    driveFaultActive = driveFault;
 }
 
 //------------
@@ -1088,9 +1091,9 @@ void Maslow_::blinkIPAddress() {
 
 //Print the motor currents. Used for monitioring the power consumption of each motor.
 void Maslow_::print_motor_currents() {
+    if (!debugEnabled) return;
     const bool jogging = sys.state() == State::Jog && calibration.currentState == READY_TO_CUT;
     const bool settling = calibration.savedAnchorMotionSettling();
-    if (!debugEnabled && !jogging && !settling) return;
 
     static unsigned long lastExecutionTime = 0;
     const unsigned long currentTime = millis();
@@ -1285,8 +1288,7 @@ void Maslow_::eStop(String message) {
     error        = true;
     errorMessage = message;
     stop();
-    log_error("Emergency stop! Stopping all motors");
-    log_warn("Emergency stop latched. Check the cause, belt tension and machine position before unlocking.");
+    log_error("急停 | " << message.c_str() << " | 已停止电机（Emergency stop）");
 }
 
 //This is the function that should prevent machine from damaging itself
@@ -1307,7 +1309,7 @@ void Maslow_::safety_control() {
             panicCounter[i]++;
             if (panicCounter[i] > tresholdHitsBeforePanic) {
                 if (sys.state() == State::Jog || sys.state() == State::Cycle) {
-                    log_warn("Motor current on " << axis_id_to_label(i).c_str() << " axis exceeded threshold of " << 4000);
+                    log_warn("Motor current on " << axis_id_to_label(encoderLines[i]).c_str() << " axis exceeded threshold of " << 4000);
                     //Maslow.panic();
                 }
                 tick[i] = true;
@@ -1349,9 +1351,14 @@ void Maslow_::safety_control() {
         const double errorMm = axis[i].getPositionError();
         if (moving && std::fabs(errorMm) > 15.0) {
             if (++positionErrorCounter[i] > 5) {
-                Maslow.eStop("Position error > 15mm while running. E-Stop triggered.");
-                log_warn("Position error on " << axis_id_to_label(encoderLines[i]).c_str()
-                         << " axis exceeded 15mm while running. Error is " << errorMm << "mm");
+                const bool jogging = sys.state() == State::Jog;
+                const double length = axis[i].getPosition(), target = axis[i].getTarget();
+                const double pwm = axis[i].getMotorPower(), current = axis[i].getMotorCurrent();
+                const auto readFailures = static_cast<unsigned>(axis[i].getEncoderReadFailures());
+                Maslow.eStop("运行中带长偏差超过 15 mm");
+                log_error((jogging ? "点动" : "加工") << "停止 | " << axis_id_to_label(encoderLines[i]).c_str()
+                          << " | 实测 " << length << " / 目标 " << target << " mm，偏差 " << errorMm
+                          << " mm，PWM " << pwm << "，电流 " << current << " ADC，编码器读取失败累计 " << readFailures);
                 return;
             }
         } else {

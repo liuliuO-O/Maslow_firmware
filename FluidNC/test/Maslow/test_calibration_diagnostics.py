@@ -26,6 +26,7 @@ class CalibrationDiagnosticsTest(unittest.TestCase):
 #include <string>
 #define log_info(...) ((void)0)
 #define log_error(...) ((void)0)
+#define log_debug(...) ((void)0)
 constexpr int ARM_COUNT = 4, CALIBRATION_IN_PROGRESS = 7;
 unsigned long clockMs = 0;
 unsigned long millis() { return clockMs; }

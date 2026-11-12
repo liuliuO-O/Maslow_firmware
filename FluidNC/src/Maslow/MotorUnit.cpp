@@ -293,7 +293,7 @@ bool MotorUnit::retract() {
         return false;
 
     String encAddrLabel = Maslow.axis_id_to_label(_encoderAddress);
-    log_info(encAddrLabel.c_str() << " pulled tight with offset " << getPosition());
+    log_info("收带 | " << encAddrLabel.c_str() << " 已拉紧并归零");
     zero();
 
     return true;
@@ -339,7 +339,7 @@ bool MotorUnit::pull_tight(int currentThreshold) {
             stop();
             retract_speed    = 0;
             retract_baseline = 700;
-            log_info("CALDIAG tight_success axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
+            log_debug("CALDIAG tight_success axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
                      << " reason=" << (diagnosticAbsolute ? (diagnosticIncrement ? "both" : "absolute") : "increment")
                      << " adc=" << currentMeasurement << " threshold=" << currentThreshold
                      << " baseline=" << diagnosticBaseline

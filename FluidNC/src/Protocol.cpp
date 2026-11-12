@@ -183,6 +183,13 @@ void send_line(Print& channel, const std::string& line) {
     }
 }
 
+void try_send_line(Print& channel, std::string* line) {
+    LogMessage msg { &channel, line, true };
+    if (!outputTask || !xQueueSend(message_queue, &msg, 0)) {
+        delete line;
+    }
+}
+
 void output_loop(void* unused) {
     while (true) {
         LogMessage message;

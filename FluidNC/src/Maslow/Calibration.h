@@ -117,6 +117,9 @@ private:
     bool horizontalInitialTensionComplete = false;
     bool horizontalMeasurementFault = false;
     unsigned long horizontalHoldConflictStart = 0;
+    void logPendingBelts(bool extending);
+    unsigned long beltOperationLogTime = 0;
+
     //Variables used for retracting state
     bool axis_homed[4]         = { false, false, false, false };
     bool retracting[ARM_COUNT] = { false, false, false, false };
@@ -194,6 +197,9 @@ private:
         unsigned long moveLastUpdate = 0;
         double moveElapsedMs = 0;
         double moveBeltOffset[ARM_COUNT] = {};
+        uint32_t moveDiagnosticLastSample = 0;
+        uint32_t moveReadFailures[ARM_COUNT] = {};
+        uint32_t moveLargeSteps[ARM_COUNT] = {};
         bool moveNeedsInit = true;
         int moveDirection = UP;
         float xStep = 0, yStep = 0;
@@ -203,11 +209,12 @@ private:
         bool settlingCompleted = false;
         unsigned long settlingStart = 0;
     } measurementState;
+    void diagnosticMoveTracking(bool withSlack);
     bool moveCalibratedHorizontal(double fromX, double fromY, double toX, double toY);
     void finishCalibrationMove(int direction);
     void resetMeasurementState();
     void resetHorizontalSampling();
-    bool failHorizontalSampling(const char* reason);
+    bool failHorizontalSampling(const char* reason, unsigned affectedBelts = 0, bool holding = false);
     bool takeStableHorizontalMeasurement(float result[4], int current, int point);
     struct HorizontalSamplingState {
         int point = -1;

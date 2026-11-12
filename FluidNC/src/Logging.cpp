@@ -36,11 +36,12 @@ void releaseLogBuffer() {
     xSemaphoreGive(logBufferMutex);
 }
 
-LogStream::LogStream(Print& channel, const char* name) : _channel(channel) {
-    _line = new std::string();
+LogStream::LogStream(Print& channel, const char* name, LogDelivery delivery)
+    : _channel(channel), _line(new std::string()), _delivery(delivery) {
     print(name);
 }
-LogStream::LogStream(const char* name) : LogStream(allChannels, name) {}
+
+LogStream::LogStream(const char* name, LogDelivery delivery) : LogStream(allChannels, name, delivery) {}
 
 size_t LogStream::write(uint8_t c) {
     *_line += (char)c;
@@ -51,5 +52,9 @@ LogStream::~LogStream() {
     if ((*_line).length() && (*_line)[0] == '[') {
         *_line += ']';
     }
-    send_line(_channel, _line);
+    if (_delivery == LogDelivery::BestEffort) {
+        try_send_line(_channel, _line);
+    } else {
+        send_line(_channel, _line);
+    }
 }

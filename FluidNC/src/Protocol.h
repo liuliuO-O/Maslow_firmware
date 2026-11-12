@@ -121,6 +121,8 @@ void protocol_send_event_from_ISR(Event* evt, void* arg = 0);
 void send_line(Print& channel, const char* message);
 void send_line(Print& channel, const std::string* message);
 void send_line(Print& channel, const std::string& message);
+// Takes ownership of the line, even if the output queue is full.
+void try_send_line(Print& channel, std::string* line);
 
 void drain_messages();
 

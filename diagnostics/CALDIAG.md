@@ -1,16 +1,12 @@
-# CALDIAG v2 — first-anchor calibration diagnostic firmware
+# Maslow 运行日志
 
-Purpose: identify the active control phase when calibration stalls. Motor direction,
-TR encoder reversal, PID gains, PWM limits, geometry, and existing tension logic are unchanged.
-This is a diagnostic build, not a confirmed calibration fix.
+日常查看 INFO、WARN 和 ERR。校准进度用从 1 开始的点号，皮带按左上（TL）、右上（TR）、左下（BL）、右下（BR）标记。采样通过会显示最大重复采样波动。收放带等待超过 5 秒时，日志只列出未完成的皮带。
 
-Build: `pio run -e wifi_s3` from `firmware`.
-Artifact: `.pio/build/wifi_s3/firmware.bin` (application image, not a merged USB-flash image).
+运行详细采集脚本前，发送 `$Message/Level=Debug`，启用原有的 `CALDIAG` 快照和各次采样。点动的 `BELT_TRACK` 和四带电流通过 `$/Maslow_debugEnabled=true` 启用。结束后可用 `$Message/Level=Info` 和 `$/Maslow_debugEnabled=false` 恢复精简显示。
 
-## Logs
+## CALDIAG 字段
 
-`CALDIAG v2 enabled` is printed when starting a fresh calibration from Belts Extended.
-Phase changes and approximately every 500 ms produce a header plus four axis lines.
+调试模式在阶段切换时以及约每 500 ms 输出阶段和四条带的详细信息。
 
 - `stage`: orientation_start, orientation_extend, orientation_return,
   measurement_start, horizontal_initial_tighten, horizontal_measure_bottom, measure, move.

@@ -178,7 +178,7 @@ void clearTrace() {
     saveCalls = 0; failingFitCount = -1; failingSave = false;
 }
 bool completed() {
-    return std::find(logLines.begin(), logLines.end(), "Find Anchors complete") != logLines.end();
+    return std::find(logLines.begin(), logLines.end(), "校准完成 | 锚点已保存 | Find Anchors complete") != logLines.end();
 }
 void prepare(Calibration& c) {
     c.currentState = CALIBRATION_IN_PROGRESS;

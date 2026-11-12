@@ -1,16 +1,36 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace MaslowSavedAnchorRecovery {
 constexpr double repeatabilityLimitMm = 1.0;
 constexpr double preloadCreepMmPerSecond = 8.0;
 constexpr double preloadSpeedMmPerSecond = 20.0;
+constexpr uint32_t preloadNoResponseMs = 750;
 
 // Current is the board's existing ADC reading, used as a load proxy.
 // Limit inward speed as well as load so one belt cannot take up slack at full speed.
 struct PreloadDrive {
     double duty = 0;
+
+    // No measured current or meaningful inward movement while commanded near full duty.
+    // An unloaded belt moving inward normally can have a low ADC reading.
+    bool unresponsive(uint32_t now, double inwardPwm, double current, double length) {
+        constexpr double minInwardPwm = 900.0;
+        constexpr double maxInactiveAdc = 5.0;
+        constexpr double minRetractionMm = 0.5;
+        if (inwardPwm < minInwardPwm || current > maxInactiveAdc) {
+            checkingResponse = false;
+            return false;
+        }
+        if (!checkingResponse || responseStartLength - length >= minRetractionMm) {
+            checkingResponse = true;
+            responseStarted = now;
+            responseStartLength = length;
+        }
+        return now - responseStarted >= preloadNoResponseMs;
+    }
 
     static bool loaded(double current, double speed, double threshold) {
         return current >= 0.82 * threshold && current <= threshold && std::fabs(speed) <= 1.0;
@@ -23,6 +43,11 @@ struct PreloadDrive {
         duty = std::clamp(duty + rate * seconds, 0.0, 1023.0);
         return static_cast<int>(std::lround(duty));
     }
+
+private:
+    bool checkingResponse = false;
+    uint32_t responseStarted = 0;
+    double responseStartLength = 0;
 };
 
 struct PoseFit {

@@ -84,6 +84,8 @@ using std::max;
 std::vector<std::string> logs;
 #define log_info(x) do { std::ostringstream s; s << x; logs.push_back(s.str()); } while(false)
 #define log_error(x) log_info(x)
+#define log_warn(x) log_info(x)
+#define log_debug(x) log_info(x)
 constexpr float BOOTSTRAP17_REPEATABILITY_MM = 15;
 enum class State { Homing, Alarm };
 struct { State current=State::Homing; void set_state(State value){current=value;} } sys;

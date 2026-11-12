@@ -31,16 +31,19 @@ enum MsgLevel {
 
 #include "MyIOStream.h"
 
+enum class LogDelivery { Wait, BestEffort };
+
 class LogStream : public Print {
 public:
-    LogStream(Print& channel, const char* name);
-    LogStream(const char* name);
+    LogStream(Print& channel, const char* name, LogDelivery delivery = LogDelivery::Wait);
+    LogStream(const char* name, LogDelivery delivery = LogDelivery::Wait);
     size_t write(uint8_t c) override;
     ~LogStream();
 
 private:
     Print&       _channel;
     std::string* _line;
+    LogDelivery  _delivery;
 };
 
 extern bool atMsgLevel(MsgLevel level);

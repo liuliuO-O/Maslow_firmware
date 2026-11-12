@@ -48,6 +48,9 @@ class SavedAnchorRecoveryTest(unittest.TestCase):
     def test_coordinated_preload_then_off_center_ready_hold(self):
         self.check('success')
 
+    def test_preload_stops_when_a_belt_has_no_current_or_inward_progress(self):
+        self.check('no_response')
+
     def test_drift_feedback_time_and_retraction_fail_safely(self):
         self.check('faults')
 
@@ -83,12 +86,13 @@ std::vector<std::string> logs;
 #define log_info(x) do {std::ostringstream s;s << x;logs.push_back(s.str());} while(false)
 #define log_warn(x) log_info(x)
 #define log_error(x) log_info(x)
+#define log_debug(x) log_info(x)
 void serviceCalibrationWatchdogs(bool=false) {}
 enum class State { Idle, Homing, Alarm };
 struct { State value=State::Idle; void set_state(State s){value=s;} State state() const {return value;} } sys;
 struct Axis {
     double position=0, target=0, settledLength=0, pwm=0, velocity=0;
-    bool fresh=true, holdHealthy=true;
+    bool fresh=true, holdHealthy=true, noCurrent=false;
     int pulls=0, holds=0, finishAfter=1, targets=0;
     uint32_t failures=0, steps=0;
     double getPosition() const { return position; }
@@ -102,7 +106,7 @@ struct Axis {
     void reset() { pulls=0; }
     void resetPID() {}
     void setTarget(double p) { target=p; ++targets; }
-    double getMotorCurrent() const { return pulls>=finishAfter && pwm<0 ? 765 : 250; }
+    double getMotorCurrent() const { return noCurrent ? 0 : pulls>=finishAfter && pwm<0 ? 765 : 250; }
     double getBeltSpeed() const { return 0; }
     double getCalibrationHoldVelocity() const { return velocity; }
     void driveIn(int duty) {
@@ -263,6 +267,28 @@ int main(int argc,char**argv) {
         }));
         assert(sys.value==State::Alarm && c.currentState==EXTENDEDOUT && c.all_axis_homed());
         assert(Maslow.positionSaves==1);
+    } else if (scenario=="no_response") {
+        prepare();
+        auto& br = Maslow.axis[_BR];
+        br.finishAfter=10000;
+        br.noCurrent=true;
+        begin();
+        finish();
+        stopped(EXTENDEDOUT,true);
+        assert(clockMs>=5700 && clockMs<6500);
+        assert(std::any_of(logs.begin(),logs.end(),[](const auto& line) {
+            return line.find("RESTORE_NO_RESPONSE belt=BR")!=std::string::npos;
+        }));
+
+        MaslowSavedAnchorRecovery::PreloadDrive monitor;
+        assert(!monitor.unresponsive(0,899,0,716.536));
+        assert(!monitor.unresponsive(10,1023,0,716.536));
+        assert(!monitor.unresponsive(510,1023,0,715.936)); // A freely retracting belt can read zero ADC.
+        assert(!monitor.unresponsive(1010,1023,0,715.336));
+        assert(!monitor.unresponsive(1250,1023,15,715.336)); // Measured current resets the window.
+        assert(!monitor.unresponsive(1260,1023,0,715.336));
+        assert(!monitor.unresponsive(2009,1023,0,715.336));
+        assert(monitor.unresponsive(2010,1023,0,715.336));
     } else if (scenario=="faults") {
         prepare();c.axis_homed[0]=false;assert(!c.beginApplyTension());
         for (const auto& a:Maslow.axis) assert(a.pulls==0);
