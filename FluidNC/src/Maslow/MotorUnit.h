@@ -61,6 +61,10 @@ public:
     double getMotorPower();
     void   update();
     bool   onTarget(double precision);
+    // Lifetime count of latched "commanded but no current and no motion" events.
+    // Diagnostic only: never alters motor output or calibration state.
+    uint32_t getDriveLossEvents() const { return driveLossEvents; }
+    bool     isDriveLossActive() const { return driveLossActive; }
 
 private:
     MaslowCalibrationHold::Controller calibrationHold;
@@ -113,6 +117,17 @@ private:
     double        amtToMove         = 0.1;
 
     int beltSpeedCounter = 0;
+
+    // Drive-loss capture state (DRV8873 protection / supply dropout signature:
+    // PWM commanded, current reads ~0, belt does not move).  Latches the event
+    // and logs a snapshot so the failure can be inspected BEFORE any power
+    // swap clears the driver fault.  No control authority.
+    unsigned long driveLossCheckMs  = 0;
+    unsigned long driveLossRunMs    = 0;
+    double        driveLossLastPos  = 0;
+    uint32_t      driveLossEvents   = 0;
+    bool          driveLossActive   = false;
+    bool          driveLossPosInit  = false;
 };
 
 #endif

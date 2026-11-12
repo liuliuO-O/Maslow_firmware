@@ -118,6 +118,50 @@ void MotorUnit::update() {
         }
         motorCurrentBuffer[9] = motor.readCurrent();
     }
+
+    // Drive-loss capture, checked every 100 ms.  Signature: |pwm|>=100 while
+    // averaged current <=5 ADC and belt moves <0.5 mm per check.  Sustained for
+    // 500 ms it latches and logs one snapshot; recovery logs once.  Thresholds
+    // intentionally strict so free-spinning slack belts (moving, or low pwm)
+    // do not trigger it.  Diagnostic only, motor outputs are untouched.
+    const unsigned long nowMs = millis();
+    if (nowMs - driveLossCheckMs >= 100) {
+        const unsigned long dtMs = driveLossCheckMs ? (nowMs - driveLossCheckMs) : 100;
+        const double        pos  = getPosition();
+        if (!driveLossPosInit) {
+            driveLossLastPos = pos;
+            driveLossPosInit = true;
+        }
+        const double pwm = _commandPWM;
+        const double cur = getMotorCurrent();
+        const bool   suspect =
+            fabs(pwm) >= 100.0 && cur <= 5.0 && fabs(pos - driveLossLastPos) < 0.5;
+        if (suspect) {
+            if (!driveLossActive) {
+                driveLossRunMs += dtMs;
+                if (driveLossRunMs >= 500) {
+                    driveLossActive = true;
+                    ++driveLossEvents;
+                    log_warn("CALDIAG drive_loss axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
+                             << " event=" << driveLossEvents << " pwm=" << pwm << " current_avg=" << cur
+                             << " current_raw=" << motor.readCurrent() << " pos=" << pos << " target=" << setpoint
+                             << " belt_speed=" << beltSpeed << " enc_fail_total=" << encoderReadFailures);
+                    log_warn("CALDIAG drive_loss hint: keep power connected; measure driver VM and motor "
+                             "terminal voltage before any cable swap, swap clears the fault state");
+                }
+            }
+        } else {
+            if (driveLossActive) {
+                log_warn("CALDIAG drive_loss_recovered axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
+                         << " event=" << driveLossEvents << " pwm=" << pwm << " current_avg=" << cur
+                         << " pos=" << pos);
+            }
+            driveLossActive = false;
+            driveLossRunMs  = 0;
+        }
+        driveLossLastPos = pos;
+        driveLossCheckMs = nowMs;
+    }
 }
 
 // Reads the encoder value and updates it's position

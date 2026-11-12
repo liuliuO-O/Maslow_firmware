@@ -1827,13 +1827,14 @@ bool Calibration::failHorizontalSampling(const char* reason, unsigned affectedBe
     struct BeltReading {
         double length, target, pwm, current;
         unsigned readFailures, largeSteps;
+        uint32_t driveLossEvents;
     } readings[ARM_COUNT] = {};
     for (int arm = _TL; arm < ARM_COUNT; ++arm) {
         if (!(affectedBelts & (1U << arm))) continue;
         auto& belt = Maslow.axis[arm];
         readings[arm] = { belt.getPosition(), belt.getTarget(), belt.getMotorPower(), belt.getMotorCurrent(),
                           static_cast<unsigned>(belt.getEncoderReadFailures() - diagnosticEncoderBaseline[arm]),
-                          static_cast<unsigned>(belt.getEncoderLargeSteps()) };
+                          static_cast<unsigned>(belt.getEncoderLargeSteps()), belt.getDriveLossEvents() };
     }
     Maslow.stopMotors();
     const char* labels[ARM_COUNT] = { "左上(TL)", "右上(TR)", "左下(BL)", "右下(BR)" };
@@ -1848,12 +1849,14 @@ bool Calibration::failHorizontalSampling(const char* reason, unsigned affectedBe
                       << " | " << labels[arm] << " 实测 " << reading.length << " / 目标 " << reading.target
                       << " mm，偏差 " << reading.length - reading.target << " mm，PWM " << reading.pwm
                       << "，电流 " << reading.current << " ADC，读取失败 " << reading.readFailures
-                      << "，编码器跳变累计 " << reading.largeSteps << " | Horizontal bootstrap measurement stopped");
+                      << "，编码器跳变累计 " << reading.largeSteps << "，驱动失灵累计 " << reading.driveLossEvents
+                      << " | Horizontal bootstrap measurement stopped");
         } else {
             log_error("校准停止 | 第 " << horizontalSampling.point + 1 << " 点 | " << reason
                       << " | " << labels[arm] << " 带长 " << reading.length << " mm，PWM " << reading.pwm
                       << "，电流 " << reading.current << " ADC，读取失败 " << reading.readFailures
-                      << "，编码器跳变累计 " << reading.largeSteps << " | Horizontal bootstrap measurement stopped");
+                      << "，编码器跳变累计 " << reading.largeSteps << "，驱动失灵累计 " << reading.driveLossEvents
+                      << " | Horizontal bootstrap measurement stopped");
         }
     }
     resetHorizontalSampling();
@@ -1987,13 +1990,27 @@ bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, 
     }
     if (!horizontalSampling.holdingSamples) return false;
     if (static_cast<unsigned long>(now - horizontalSampling.phaseStarted) >= settlingTimeoutMs) {
-        unsigned outsideTolerance = 0;
+        // Explain WHY the window never closed, not just who is off target now.
+        // The held flag also fails on full pwm (>=1000), so an arm can block
+        // sampling without currently being outside the 1 mm tolerance.
+        unsigned errMask = 0, fullPwmMask = 0, driveLossMask = 0;
         for (int arm = _TL; arm < ARM_COUNT; ++arm) {
             auto& belt = Maslow.axis[arm];
             if (std::fabs(belt.getPosition() - belt.getTarget()) > MaslowCalibrationStability::maxPositionErrorMm)
-                outsideTolerance |= 1U << arm;
+                errMask |= 1U << arm;
+            if (std::fabs(belt.getMotorPower()) >= 1000.0) fullPwmMask |= 1U << arm;
+            if (belt.getDriveLossEvents() > 0) driveLossMask |= 1U << arm;
         }
-        return failHorizontalSampling("8 秒内未能稳定采样", outsideTolerance, true);
+        log_error("校准停止 | 第 " << horizontalSampling.point + 1
+                  << " 点 | 8 秒稳定窗口诊断 | 偏差超1mm掩码=" << errMask << " 满输出掩码=" << fullPwmMask
+                  << " 跨度复位掩码=" << horizontalSampling.stabilityDiagnostics.spanResetMask
+                  << " 观测间隙复位=" << horizontalSampling.stabilityDiagnostics.observationGapResets
+                  << " 次 | 驱动失灵累计掩码=" << driveLossMask
+                  << " | 掩码位: TL=1 TR=2 BL=4 BR=8");
+        // Print the per-arm detail line for every arm, not only off-target ones:
+        // a drifting or fully-driven arm can be back inside tolerance at the
+        // timeout instant and would otherwise leave no evidence.
+        return failHorizontalSampling("8 秒内未能稳定采样", 15U, true);
     }
 
     float position[ARM_COUNT];
@@ -2004,7 +2021,8 @@ bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, 
                            <= MaslowCalibrationStability::maxPositionErrorMm
                     && std::fabs(Maslow.axis[arm].getMotorPower()) < 1000.0;
     }
-    if (!horizontalSampling.stability.update(static_cast<uint32_t>(now), position, held)) return false;
+    if (!horizontalSampling.stability.update(static_cast<uint32_t>(now), position, held,
+                                             &horizontalSampling.stabilityDiagnostics)) return false;
     auto kinematics = getKinematics();
     if (!kinematics) return failHorizontalSampling("采样时无法读取运动学配置");
     const float z = get_mpos()[2] + kinematics->getSpoilboardThickness() + kinematics->getWorkThickness();

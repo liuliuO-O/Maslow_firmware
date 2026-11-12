@@ -224,6 +224,9 @@ private:
         uint32_t readFailures[ARM_COUNT] = {};
         uint32_t largeSteps[ARM_COUNT] = {};
         MaslowCalibrationStability::Window stability;
+        // Why the 750 ms window keeps resetting: per-arm span resets and
+        // observation gaps.  Reported when the 8 s settle timeout fires.
+        MaslowCalibrationStability::Diagnostics stabilityDiagnostics;
     } horizontalSampling;
     bool horizontalSamplingReferenceInvalid = false;
     float coarseStepX = 150.0f, coarseStepY = 150.0f;
