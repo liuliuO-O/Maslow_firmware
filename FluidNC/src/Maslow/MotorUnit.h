@@ -128,6 +128,17 @@ private:
     uint32_t      driveLossEvents   = 0;
     bool          driveLossActive   = false;
     bool          driveLossPosInit  = false;
+    // Short rolling history (100 ms per entry) dumped when drive_loss latches,
+    // so the next occurrence shows whether current fell abruptly or decayed.
+    struct DriveSample {
+        int16_t  pwm;
+        uint16_t cur;
+    };
+    static constexpr int driveHistLen = 12;  // 1.2 s
+    DriveSample driveHist[driveHistLen] = {};
+    int         driveHistPos            = 0;
+    int         driveHistFill           = 0;
+    double      driveLossIdleCurrent    = -1.0;  // last average current seen with |pwm| < 50
 };
 
 #endif

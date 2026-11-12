@@ -134,6 +134,14 @@ void MotorUnit::update() {
         }
         const double pwm = _commandPWM;
         const double cur = getMotorCurrent();
+        // Rolling 1.2 s history so a latched event can show whether the current
+        // collapsed abruptly (protection trip / supply open) or decayed
+        // (connector heating, thermal fold-back).
+        driveHist[driveHistPos] = { static_cast<int16_t>(constrain(pwm, -32768.0, 32767.0)),
+                                    static_cast<uint16_t>(constrain(cur, 0.0, 65535.0)) };
+        driveHistPos            = (driveHistPos + 1) % driveHistLen;
+        if (driveHistFill < driveHistLen) ++driveHistFill;
+        if (fabs(pwm) < 50.0) driveLossIdleCurrent = cur;
         const bool   suspect =
             fabs(pwm) >= 100.0 && cur <= 5.0 && fabs(pos - driveLossLastPos) < 0.5;
         if (suspect) {
@@ -145,7 +153,17 @@ void MotorUnit::update() {
                     log_warn("CALDIAG drive_loss axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
                              << " event=" << driveLossEvents << " pwm=" << pwm << " current_avg=" << cur
                              << " current_raw=" << motor.readCurrent() << " pos=" << pos << " target=" << setpoint
-                             << " belt_speed=" << beltSpeed << " enc_fail_total=" << encoderReadFailures);
+                             << " belt_speed=" << beltSpeed << " enc_fail_total=" << encoderReadFailures
+                             << " idle_cur=" << driveLossIdleCurrent);
+                    String hist;
+                    for (int i = 0; i < driveHistFill; ++i) {
+                        const int idx = (driveHistPos + driveHistLen - driveHistFill + i) % driveHistLen;
+                        hist += String(driveHist[idx].pwm);
+                        hist += '/';
+                        hist += String(driveHist[idx].cur);
+                        if (i + 1 < driveHistFill) hist += ' ';
+                    }
+                    log_warn("CALDIAG drive_loss hist_100ms pwm/cur oldest_to_newest: " << hist.c_str());
                     log_warn("CALDIAG drive_loss hint: keep power connected; measure driver VM and motor "
                              "terminal voltage before any cable swap, swap clears the fault state");
                 }
