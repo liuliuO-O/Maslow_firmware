@@ -42,6 +42,7 @@ struct Labels {
 } Maslow;
 
 static int warnings = 0;
+#define log_info(x) do { } while (false)
 #define log_warn(x) do { ++warnings; } while (false)
 #define log_debug(x) do { } while (false)
 

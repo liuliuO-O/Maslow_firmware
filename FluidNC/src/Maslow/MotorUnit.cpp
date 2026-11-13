@@ -471,6 +471,15 @@ bool MotorUnit::pull_tight(int currentThreshold) {
             retract_baseline = 700;
             tightOutcome_    = TIGHT_OK;
             tightHoldPwm     = holdPwm;
+            // One INFO line per belt per tensioning attempt: the operator needs the
+            // decision and the held duty without turning on Debug (Debug also emits
+            // CALDIAG trace every 500 ms during calibration).
+            log_info("拉紧成功 | " << Maslow.axis_id_to_label(_encoderAddress).c_str()
+                     << " | 电流 " << currentMeasurement << " / 阈值 " << currentThreshold
+                     << " | 判据 "
+                     << (diagnosticAbsolute ? (diagnosticIncrement ? "绝对+增量" : "绝对电流")
+                                            : "电流增量")
+                     << " | 保持占空比 " << holdPwm << " (上限 " << tightHoldPwmCap << ")");
             log_debug("CALDIAG tight_success axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
                      << " reason=" << (diagnosticAbsolute ? (diagnosticIncrement ? "both" : "absolute") : "increment")
                      << " adc=" << currentMeasurement << " threshold=" << currentThreshold
