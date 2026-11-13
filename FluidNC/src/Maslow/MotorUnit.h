@@ -16,6 +16,16 @@
 
 class MotorUnit {
 public:
+    // Result of the most recent pull_tight() attempt.  Tightening used to be a
+    // single bool, so a jam and a successful pull were indistinguishable and the
+    // caller kept requesting more force.
+    enum TightOutcome : uint8_t {
+        TIGHT_PULLING = 0,  // still taking up slack
+        TIGHT_OK,           // reached the tension threshold
+        TIGHT_STALLED,      // belt does not move while carrying load
+        TIGHT_NO_DRIVE      // commanded force produces no current at all
+    };
+
     void     begin(int forwardPin, int backwardPin, int readbackPin, int encoderAddress, int channel1, int channel2,
                    bool reverseEncoder = false);
     void     zero();
@@ -49,6 +59,11 @@ public:
     bool     retract();
     bool     extend(double targetLength);
     bool     pull_tight(int currentThreshold);
+    // Latching diagnostics for the tensioning path.  A latched fault suppresses
+    // all further pull_tight output until reset()/stop(), so a jam cannot turn
+    // into a sustained full-duty command that trips the driver protection.
+    TightOutcome tightOutcome() const { return tightOutcome_; }
+    bool         tightFault() const { return tightOutcome_ == TIGHT_STALLED || tightOutcome_ == TIGHT_NO_DRIVE; }
     bool     motor_test();
     void     fullOut();
     void     fullIn();
@@ -109,6 +124,17 @@ private:
     float    alpha                    = .2;
     uint16_t retract_speed            = 0;
     float    retract_baseline         = 700;
+
+    // Tensioning outcome latch and stall guard state (see pull_tight()).
+    TightOutcome tightOutcome_  = TIGHT_PULLING;
+    uint16_t     tightHoldPwm   = 0;  // duty held after TIGHT_OK, never re-ramped
+    unsigned long stallCheckMs  = 0;
+    double        stallCheckPos = 0;
+    uint32_t      stallMs       = 0;
+    static constexpr uint16_t stallMinPwm      = 1000;  // only judge a jam near full duty
+    static constexpr double   stallMinMotionMm = 0.4;  // movement that proves the belt is still travelling
+    static constexpr uint32_t stallWindowMs    = 600;  // frozen at full duty this long => jam, not tension
+    static constexpr uint16_t tightHoldPwmCap  = 700;  // hold force cap after TIGHT_OK
 
     //comply variables
     unsigned long lastCallToComply  = millis();

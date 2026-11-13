@@ -724,34 +724,25 @@ void Calibration::diagnosticUpdate() {
 // -Maslow homing loop. This is used whenver any of the homing funcitons are active (belts extending or retracting)
 void Calibration::home() {
     switch (currentState) {
-        case RETRACTING:
+        case RETRACTING: {
             //run all the retract functions untill we hit the current limit
-            if (retracting[_TL]) {
-                if (Maslow.axis[_TL].retract()) {
-                    retracting[_TL] = false;
-                    axis_homed[0]   = true;
-                    extended[_TL]   = false;
-                }
-            }
-            if (retracting[_TR]) {
-                if (Maslow.axis[_TR].retract()) {
-                    retracting[_TR] = false;
-                    axis_homed[1]   = true;
-                    extended[_TR]   = false;
-                }
-            }
-            if (retracting[_BL]) {
-                if (Maslow.axis[_BL].retract()) {
-                    retracting[_BL] = false;
-                    axis_homed[2]   = true;
-                    extended[_BL]   = false;
-                }
-            }
-            if (retracting[_BR]) {
-                if (Maslow.axis[_BR].retract()) {
-                    retracting[_BR] = false;
-                    axis_homed[3]   = true;
-                    extended[_BR]   = false;
+            const int arms[ARM_COUNT] = { _TL, _TR, _BL, _BR };
+            for (int i = 0; i < ARM_COUNT; ++i) {
+                const int arm = arms[i];
+                if (!retracting[arm]) continue;
+                if (Maslow.axis[arm].retract()) {
+                    retracting[arm] = false;
+                    axis_homed[arm] = true;
+                    extended[arm]   = false;
+                } else if (Maslow.axis[arm].tightFault()) {
+                    // Retraction never reached the current limit: the belt is
+                    // jammed or the driver has no output.  Latch an emergency stop
+                    // so no further force is commanded into the jam.
+                    const char* labels[ARM_COUNT] = { "左上(TL)", "右上(TR)", "左下(BL)", "右下(BR)" };
+                    const bool  noDrive = Maslow.axis[arm].tightOutcome() == MotorUnit::TIGHT_NO_DRIVE;
+                    Maslow.eStop(String(noDrive ? "收带异常 | 驱动无电流输出 | " : "收带异常 | 带长不变化（堵转）| ")
+                                 + labels[arm]);
+                    return;
                 }
             }
 
@@ -763,6 +754,7 @@ void Calibration::home() {
             }
 
             break;
+        }
         case EXTENDING:
             //decompress belts for the first half second
             if (millis() - extendCallTimer < 700) {
@@ -1910,7 +1902,16 @@ bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, 
         // Preserve the existing preload behavior while other axes finish. This
         // phase runs only once per waypoint, including across acquisition retries.
         for (int arm = _TL; arm < ARM_COUNT; ++arm) {
-            if (Maslow.axis[arm].pull_tight(current)) horizontalTight[arm] = true;
+            auto& belt = Maslow.axis[arm];
+            // Checked before the next pull so a jam never gets one more frame of
+            // force.  pull_tight() has already suppressed its own output.
+            if (belt.tightFault()) {
+                const bool noDrive = belt.tightOutcome() == MotorUnit::TIGHT_NO_DRIVE;
+                return failHorizontalSampling(noDrive ? "初次拉紧时驱动无电流输出（已停止加力）"
+                                                      : "初次拉紧时带长不变化（堵转，已停止加力）",
+                                              1U << arm);
+            }
+            if (belt.pull_tight(current)) horizontalTight[arm] = true;
         }
         diagnosticTightMask = (horizontalTight[_TL] ? 1U : 0U) | (horizontalTight[_TR] ? 2U : 0U)
                            | (horizontalTight[_BL] ? 4U : 0U) | (horizontalTight[_BR] ? 8U : 0U);
@@ -2053,6 +2054,22 @@ bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, 
 
 bool Calibration::take_measurement(float result[4], int dir, int run, int current, int waypoint) {
     serviceCalibrationWatchdogs(false);
+    // A latched tensioning fault means at least one belt cannot follow.  Abort
+    // before issuing any more force; pull_tight() already cut its own output.
+    for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+        auto& belt = Maslow.axis[arm];
+        if (!belt.tightFault()) continue;
+        const bool noDrive = belt.tightOutcome() == MotorUnit::TIGHT_NO_DRIVE;
+        if (orientation == HORIZONTAL) {
+            return failHorizontalSampling(noDrive ? "拉紧时驱动无电流输出（已停止加力）"
+                                                  : "拉紧时带长不变化（堵转，已停止加力）",
+                                          1U << arm);
+        }
+        const char* labels[ARM_COUNT] = { "左上(TL)", "右上(TR)", "左下(BL)", "右下(BR)" };
+        log_error("拉紧异常 | " << (noDrive ? "驱动无电流输出" : "带长不变化（堵转）") << " | " << labels[arm]
+                                << " | 已停止加力，请检查该轴机械与供电");
+        return false;
+    }
     diagnosticRun = run;
     diagnosticCurrentThreshold = current;
     // Apply Tension and vertical/grid measurements retain their existing policy.

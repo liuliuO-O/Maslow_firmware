@@ -86,16 +86,21 @@ std::vector<std::string> logs;
 #define log_debug(x) log_info(x)
 void serviceCalibrationWatchdogs(bool=false){}
 struct Axis {
+    enum TightOutcome : unsigned char { TIGHT_PULLING, TIGHT_OK, TIGHT_STALLED, TIGHT_NO_DRIVE };
     double position=1000,target=1000,pwm=0;
     int pulls=0,pids=0,sets=0,stops=0,finishAfter=1;
     uint32_t failures=0,steps=0;
     bool holdHealthy=true;
+    bool tightFault(){return false;}
+    TightOutcome tightOutcome(){return TIGHT_PULLING;}
     double getPosition(){return position;}
     double getTarget(){return target;}
     double getMotorPower(){return pwm;}
     double getMotorCurrent(){return 0;}
     uint32_t getEncoderReadFailures(){return failures;}
     uint32_t getEncoderLargeSteps(){return steps;}
+    uint32_t getDriveLossEvents(){return driveLossEvents;}
+    uint32_t driveLossEvents=0;
     void setTarget(double p){target=p;++sets;}
     void stop(){pwm=0;++stops;}
     void reset(){}
@@ -189,12 +194,16 @@ int main() {
     Calibration drifting;setup(drifting);prime(drifting,out);Maslow.axis[_BR].position+=11.7;
     logs.clear();
     assert(!step(drifting,out,0,8000) && drifting.horizontalMeasurementFault);
-    assert(logs.size()==1);
+    // Since 2bfe325 the timeout emits a summary line plus one detail line per arm.
+    bool sawDiagnostic=false,sawTimeout=false,sawArmDetail=false;
+    for(const auto& line:logs){
+        if(line.find("8 秒稳定窗口诊断")!=std::string::npos)sawDiagnostic=true;
+        if(line.find("8 秒内未能稳定采样")!=std::string::npos)sawTimeout=true;
+        if(line.find("右下(BR)")!=std::string::npos&&line.find("偏差 11.7 mm，PWM -1023")!=std::string::npos
+           &&line.find("电流 0 ADC，读取失败 0")!=std::string::npos)sawArmDetail=true;
+    }
+    assert(sawDiagnostic&&sawTimeout&&sawArmDetail);
     assert(logs[0].find("第 1 点")!=std::string::npos);
-    assert(logs[0].find("8 秒内未能稳定采样")!=std::string::npos);
-    assert(logs[0].find("右下(BR)")!=std::string::npos);
-    assert(logs[0].find("偏差 11.7 mm，PWM -1023")!=std::string::npos);
-    assert(logs[0].find("电流 0 ADC，读取失败 0")!=std::string::npos);
     Calibration preloadTimeout;setup(preloadTimeout);Maslow.axis[_BL].finishAfter=100000;
     assert(!step(preloadTimeout,out));
     assert(!step(preloadTimeout,out,0,30000) && preloadTimeout.horizontalMeasurementFault);

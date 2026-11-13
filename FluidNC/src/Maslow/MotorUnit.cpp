@@ -363,11 +363,31 @@ bool MotorUnit::retract() {
 
 // Pulls the belt until we hit a current treshold; returns true when done
 bool MotorUnit::pull_tight(int currentThreshold) {
+    const unsigned long now = millis();
     //call at most every 5ms
-    if (millis() - lastCallToRetract < 4) {
+    if (now - lastCallToRetract < 4) {
         return false;
     }
-    lastCallToRetract = millis();
+    lastCallToRetract = now;
+
+    // A latched fault means this belt cannot be tensioned any further.  Holding
+    // the bridge at zero is what keeps a jam from becoming a sustained 100% duty
+    // command, which is what trips the DRV8873 over-current / thermal limit and
+    // then looks like "no current, no motion, full pwm" in the logs.
+    if (tightFault()) {
+        motor.stop();
+        _commandPWM = 0;
+        return false;
+    }
+
+    // Once tight, hold the duty that produced that decision instead of ramping up
+    // from zero again.  Every re-ramp used to add another inward nudge every
+    // ~130 ms for as long as a neighbouring belt was still tightening.
+    if (tightOutcome_ == TIGHT_OK) {
+        motor.backward(tightHoldPwm);
+        _commandPWM = -tightHoldPwm;
+        return false;
+    }
 
     //Gradually increase the pulling speed
     if (random(0, 2) == 1) {
@@ -388,26 +408,76 @@ bool MotorUnit::pull_tight(int currentThreshold) {
         incrementalThresholdHits = 0;
     }
 
+    // Stall guard.  A belt that is genuinely tight still drives the current up to
+    // the configured threshold; a jam sits well below it and a driver that has
+    // already shut down shows no current at all.  Sampled every 100 ms and judged
+    // only after the window closes, so the ADC averaging buffer is settled.
+    const double positionNow = getPosition();
+    if (stallCheckMs == 0 || now - stallCheckMs >= 100) {
+        const uint32_t windowMs = stallCheckMs ? static_cast<uint32_t>(now - stallCheckMs) : 0;
+        const double   movedMm  = stallCheckMs ? std::fabs(positionNow - stallCheckPos) : 0.0;
+        if (retract_speed >= stallMinPwm && windowMs > 0 && movedMm < stallMinMotionMm) {
+            stallMs += windowMs;
+        } else {
+            stallMs = 0;
+        }
+        stallCheckPos = positionNow;
+        stallCheckMs  = now;
+        if (stallMs >= stallWindowMs) {
+            // Near full duty with no travel.  The tension tests above have not
+            // fired, so more duty cannot produce tension: only heat.  A current
+            // already close to the threshold is left alone (it is about to pass),
+            // which also keeps machines whose belts tension below the configured
+            // threshold working exactly as before.
+            const double meanCurrent = getMotorCurrent();
+            if (meanCurrent < 0.8 * currentThreshold) {
+                const bool noDrive = meanCurrent <= 5.0;
+                const int  pwmAtFault = -_commandPWM;
+                tightOutcome_        = noDrive ? TIGHT_NO_DRIVE : TIGHT_STALLED;
+                motor.stop();
+                _commandPWM      = 0;
+                retract_speed    = 0;
+                retract_baseline = 700;
+                log_warn("CALDIAG tight_fault axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
+                         << " reason=" << (noDrive ? "no_drive" : "stall")
+                         << " pwm=" << pwmAtFault << " current_avg=" << meanCurrent
+                         << " current_raw=" << currentMeasurement << " threshold=" << currentThreshold
+                         << " baseline=" << retract_baseline << " frozen_ms=" << static_cast<unsigned>(stallMs)
+                         << " motion_mm=" << movedMm << " pos=" << positionNow
+                         << " note=output_suppressed_until_reset");
+                return false;
+            }
+        }
+    }
+
     if (retract_speed > 15) {  //20 is not the actual speed, it is the amount of time so we don't trigger immediately
-        if (currentMeasurement > currentThreshold || incrementalThresholdHits > 2) {
+        // Decision unchanged: the incremental test still reports a taut belt on
+        // this machine (observed ~0.7 x threshold), so raising a current floor
+        // here would stop normal retraction from ever completing.
+        const bool absolute = currentMeasurement > currentThreshold;
+        const bool increment = incrementalThresholdHits > 2;
+        if (absolute || increment) {
             // Capture the values used by the original decision before stop/reset.
             // Report only after stopping; do not add ADC reads or change the condition.
             const double diagnosticPWM = _commandPWM;
             const float diagnosticBaseline = retract_baseline;
             const int diagnosticHits = incrementalThresholdHits;
-            const bool diagnosticAbsolute = currentMeasurement > currentThreshold;
-            const bool diagnosticIncrement = incrementalThresholdHits > 2;
+            const bool diagnosticAbsolute = absolute;
+            const bool diagnosticIncrement = increment;
+            const uint16_t holdPwm = retract_speed < tightHoldPwmCap ? retract_speed : tightHoldPwmCap;
             //stop motor, reset variables
             stop();
             retract_speed    = 0;
             retract_baseline = 700;
+            tightOutcome_    = TIGHT_OK;
+            tightHoldPwm     = holdPwm;
             log_debug("CALDIAG tight_success axis=" << Maslow.axis_id_to_label(_encoderAddress).c_str()
                      << " reason=" << (diagnosticAbsolute ? (diagnosticIncrement ? "both" : "absolute") : "increment")
                      << " adc=" << currentMeasurement << " threshold=" << currentThreshold
                      << " baseline=" << diagnosticBaseline
                      << " delta=" << (currentMeasurement - diagnosticBaseline)
                      << " delta_threshold=" << incrementalThreshold << " hits=" << diagnosticHits
-                     << " pwm_before_stop=" << diagnosticPWM << " pos=" << getPosition());
+                     << " pwm_before_stop=" << diagnosticPWM << " hold_pwm=" << holdPwm << " pos=" << getPosition());
             return true;
         } else {
             return false;
@@ -521,7 +591,7 @@ void MotorUnit::fullOut() {
 //Runs the motor at full speed in
 void MotorUnit::fullIn() {
     motor.fullIn();
-    _commandPWM = 1023;
+    _commandPWM = -1023;  // inward: keep the reported duty consistent with driveIn()
 }
 
 // Reset all the axis variables
@@ -532,6 +602,13 @@ void MotorUnit::reset() {
     amtToMove                = 0;
     lastPosition             = getPosition();
     beltSpeedTimer           = millis();
+    // A new tensioning phase (retract, calibration waypoint, release) starts with
+    // a clean latch; the fault only suppresses output until the caller resets.
+    tightOutcome_  = TIGHT_PULLING;
+    tightHoldPwm   = 0;
+    stallCheckMs   = 0;
+    stallCheckPos  = lastPosition;
+    stallMs        = 0;
 }
 
 // Resets PID state to clear any accumulated integral term.

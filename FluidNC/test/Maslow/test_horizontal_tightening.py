@@ -20,6 +20,9 @@ class HorizontalTighteningTest(unittest.TestCase):
 #include <array>
 enum { _TL, _TR, _BL, _BR };
 int tick;
+struct MotorUnit {
+    enum TightOutcome : unsigned char { TIGHT_PULLING, TIGHT_OK, TIGHT_STALLED, TIGHT_NO_DRIVE };
+};
 struct Axis {
     int finish = 0, calls = 0, stops = 0, pwm = 0;
     double target = -1, position = 42;
@@ -29,11 +32,14 @@ struct Axis {
         if (tick == finish) { stop(); return true; }
         return false;
     }
+    bool tightFault() { return false; }
+    MotorUnit::TightOutcome tightOutcome() { return MotorUnit::TIGHT_PULLING; }
     void stop() { ++stops; pwm = 0; }
     double getPosition() { return position; }
     void setTarget(double p) { target = p; }
 };
 struct { Axis axis[4]; } Maslow;
+bool failHorizontalSampling(const char*, unsigned, bool = false) { return false; }
 void diagnosticStage(const char*) {}
 bool tight[4];
 bool initial_tension_complete;
