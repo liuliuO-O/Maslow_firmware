@@ -21,6 +21,7 @@
 | 11-12 | `be36439` | drive_loss 锁存时输出 1.2 s 的 pwm/电流历史（12 组），用于区分突变与渐变。已 OTA 验证。 |
 | 11-13 | `e97f210`（构建标识 `8801f4d`） | 校准期间每 500 ms 输出一条四臂 `pos,current,pwm` 的 `CALDIAG trace`。10:34 构建完成；是否刷写未核实。 |
 | 11-13 | `5eec817` | 拉紧路径增加堵转与无电流锁存。`pull_tight()` 改为返回 `TightOutcome`：接近满占空比（≥1000）且 600 ms 内带长变化 <0.4 mm 时，平均电流 <0.8×阈判 `stall`、≤5 ADC 判 `no_drive`，立即把输出切 0 并锁存，直到 `reset()`；判紧后保持当时占空比（≤700），不再每次从 0 重爬。收带分支锁存即急停，标定初拉紧与采样入口按轴上报。判紧阈值（绝对 1300 / 增量 baseline+125）未改。新增 `test_tension_stall_guard.py` 5 个场景，水平拉紧与水平采样回归通过，`wifi_s3` 构建成功。已 OTA 刷写（见 `120447` 镜像行）。 |
+| 11-13 | `6395726` | 落定失败改为按连续次数判废带长基准。readyHold 分支原先无条件 `markBeltPositionsStale()`，18:2x 的 Jog Y-100 只差 BR 0.24 mm 就把整场带长基准判废。现在连续 `maxConsecutiveSettleFailures`（3）次失败才判废：前两次保留 NVS 基准、只出 WARN 并提示重新张紧；判据本身（2.5 mm / 4000 ms）一个字未改，失败仍停车、报错、须重新张紧才能动。落定成功才清零计数。同一提交补登记 16:40 已刷写但未入库的四处改动（就位容差/超时提为常量、`CalibrationHold::maxDrivePWM` 600→800、`Apply_Tension_Max_Residual_Mm` 运行时范围与 MachineConfig 统一 0.5~8.0、质量类失败回 Idle、TAKING_SLACK 不判废）。新增 `settle_streak` 场景；`test_saved_anchor_recovery` 7/7，全量 34/36（2 项为既有编码器夹具签名失配）。 |
 
 ## 镜像和部署
 
@@ -52,6 +53,7 @@
 | 11-13 | `120447` 拉紧堵转守卫 | 切断“堵转仍持续加力 → 驱动器保护”的软件链路：拉紧锁存堵转/无电流并立即断输出，判紧后保持占空比不再重爬，收带与标定入口遇锁存即上报。新增 5 场景回归 + 水平拉紧/采样回归通过，`wifi_s3` 构建成功（RAM 43.0%、Flash 66.5%）。**已刷写**：11-13 OTA 到 192.168.1.78，HTTP 200 + `{"status":"3"}`，回连后 `$I` 自报 `8801f4d-dirty`（构建先于提交，dirty 工作树即 `5eec817` 内容），上传镜像 SHA-256 与下表一致。stall 阈值与保持占空比的实机适配性待验证。产物见 `backups/20261113-120447-拉紧堵转守卫`，构建日志 `logs/20261113-120447-拉紧堵转守卫-wifi_s3.log`，刷写日志 `logs/20261113-120447-拉紧堵转守卫-ota-flash.log`。 |
 | 11-13 | `140952` 拉紧成功 INFO 日志 | 判紧成功从 `log_debug` 提升为 INFO 级中文单行：`拉紧成功 \| 轴 \| 电流 / 阈值 \| 判据 \| 保持占空比 (上限 700)`，无需打开 Debug 即可确认保持占空比生效；原 `CALDIAG tight_success` 详细行保留在 Debug 级。源码提交 `5bc44bf`，回归 4 项通过，`wifi_s3` 构建成功（47.53 s）。**已刷写**：11-13 OTA 到 192.168.1.78，HTTP 200 + `{"status":"3"}`，回连 `$I` 自报 `6de26ff-dirty`，日志级别已从临时 Debug 改回 Info。产物见 `backups/20261113-140952-拉紧成功INFO日志`，构建日志 `logs/20261113-tight-success-info-wifi_s3.log`。 |
 | 11-13 | `143500` 保持环突破静摩擦 | 修 14:04 wp=1 的「8 秒稳定窗口失败、偏差超1mm掩码=8」。根因：保持环为纯比例，无积分项，各轴停在 `偏差 = 驻留占空比/kp` 的稳态点（实测 0.580/0.612/0.891/1.148 mm 对应 −236/−245/−323/−395 PWM，四点与 P 律复算吻合到个位数），BR 需力最大故跨过 1 mm 门限，非堵转、非驱动失灵、未饱和。改动：有界突破辅助力（偏差 >0.25 mm 且 <0.15 mm/s 时 400 PWM/s 上爬、上限 380，进带内 1200 PWM/s 卸力，移动且带外则保持）+ 卡滞判据（顶到上限 2 s 仍在 1 mm 外报「保位加力到上限仍无位移」）。源码提交 `5c1a79d`，仿真 1.15 mm 偏差 3.5 s 收敛到 0.249 mm 无过冲，主机回归 33/35（2 项为既有编码器夹具问题）。**已刷写**：OTA 后 `$I` 自报 `0b16018-dirty`。产物见 `backups/20261113-143500-保持环突破静摩擦`，构建日志 `logs/20261113-breakaway-assist-wifi_s3.log`。这是截至本记录已确认部署的最新应用镜像。 |
+| 11-13 | `1855` 落定失败保留基准 | 修 18:2x 的「Jog Y-100 落定 4 s 超时」处置代价：四轴偏差 TL 0.388 / TR 0.070 / BL 2.305 / BR 2.753 mm，只有 BR 越过 2.5 mm 判定线 0.24 mm，日志自身写着 `belt_reference_valid=1`，但 readyHold 分支无条件判废，代价是整场重做收带/放带。改动：连续 3 次落定失败才判废带长基准，前两次保留并 WARN；判定线、超时、失败后必须重新张紧的要求全部不变。源码提交 `6395726`（其内一并补登记 16:40 已刷写的四处改动），`wifi_s3` 构建 SUCCESS 58 s，`test_saved_anchor_recovery` 7/7。**待刷写**：镜像已备份但未 OTA，设备当前仍为 `db4346a-dirty`（即 16:40 的 `maxDrivePWM=800` 版）。产物见 `backups/20261113-1855-落定失败保留基准`，构建日志 `logs/build_20261113_1852.log`。 |
 
 11-13 `140952` 上机说明（在 `120447` 基础上，可直接照做）：
 
@@ -108,5 +110,27 @@
 | `20261113-120447-拉紧堵转守卫-firmware.bin` | `c68ea240a2391406eafd97696e96b09db44e5666ffe61c8c3c098a64aafa8bad` |
 | `20261113-140952-拉紧成功INFO日志-firmware.bin` | `bd0fa202f78c7411def9b1b9c2323b2a861444d0580404ee6d6523b2f74dfbf7` |
 | `20261113-143500-保持环突破静摩擦-firmware.bin` | `4b80e69310ac1e0ae276fab96f488565f458d0f40e135c44e1aa494407cb0ccc` |
+| `20261113-1855-落定失败保留基准-firmware.bin` | `2a22a6021b0ea867c923e677fc5e39dbd83444fbbb3656c08bd383ab7c68d0e7` |
 
 以后每次变更记录日期、源码提交、改动目的、产物与 SHA-256、验证结果、部署对象和回退路径。已有实机结果沿用原日志，未完成的验证明确标注。
+
+## 换主板后的配置统一（11-13 15:15–15:30）
+
+- 设备：新主板 MAC `84-C7-BB-73-BE-E8`，IP `192.168.1.130`，SSID `KADA1012`（旧板为 `192.168.1.78`，已下线）。Web 为 ESP3D，`/login?USER=admin&PASSWORD=admin` 返回 `authentication_lvl: admin`。
+- 固件：`$I` = `codex/fix-maslow-stop-abort-20261109-db4346a-dirty`，即当前源码 HEAD（含 `5c1a79d` 保持环突破静摩擦）。与旧板刷写的 `0b16018-dirty` 是同一份 `5c1a79d` 逻辑，仅版本戳不同；本地构建 `.pio/build/wifi_s3/firmware.bin` 2049984 B / SHA-256 `531d6ab0cffed1674112650fa96058ff35ff0f61bd493a7a5fd92102e36a8d08`（11-13 14:47），故未重复刷写。
+- 出厂配置与旧板差异（新板为整机默认）：`Maslow_calibration_grid_size` 9→3、`Maslow_Retract_Current_Threshold` 1300→850、`Maslow_Extend_Dist` 2600→676.156372、`Maslow_Work_Area_X/Y` 2440×1220→500×300、kinematics 锚点 4340×3230→旧板 980×1090 实测值（tlX -5.767656 / tlY 1092.876343 / tlZ -40 / trX 974.294800 / trY 1086.131348 / trZ 20 / blZ -20 / brX 958.975342 / brZ -10），共 14 个键。
+- 恢复路径：`$CD` 导出旧板配置 → **以新板自身导出为底稿只改上述 14 个键**（避免缺固件新增键）→ `/files` 上传 `/maslow.yaml`（ESP3D multipart 顺序：`path` + `<路径>S`=字节数 + `myfile[]`）→ 发送 `[ESP444]RESTART`。
+- 校验：重启后回读 `$CD` 与旧板转储仅差 2 项新固件默认键（`Maslow_Apply_Tension_Max_Residual_Mm` 2.5、`Maslow_Jog_Max_Feed` 500），旧板转储尾部的急停 ERROR 不再出现。`$Message/Level=Info`、`$GSTATE`=0(Idle)、`$MINFO` 四轴 0 / homed=false / extended=false，需重新收带→放带建立带长基准。
+- 证据：`logs/dev-config-dump-20261113.txt`（旧板）、`logs/new-board-config-20261113.yaml`（新板出厂）、`logs/maslow-restore-20261113.yaml`（上传件）、`logs/new-board-config-after-20261113.yaml`（回读）。
+- 工具：新增 `tools/fluidnc_cmd.py`（telnet 发指令取回显）、`tools/esp3d_upload.py`（ESP3D 文件上传）；`tools/ota_upload.py` 默认地址改为 `192.168.1.130`。
+- 经验：Git Bash 里给 URL 传路径参数必须 `MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"`，且脚本内的本地路径要写 `D:/…`，否则 `/maslow.yaml` 被改写成 Windows 绝对路径，设备返回 `status: Upload failed`。
+
+## 落定失败处置分级（11-13 18:5x，镜像 `1855`，待刷写）
+
+- 现象：Jog Y-100 落定 4 s 超时，`longest_in_tolerance_ms=0`（一次都没全部进过 2.5 mm 门），`outside_mask=8`（仅 BR），峰 TL 0.388 / TR 0.070 / BL 2.305 / BR 2.753 mm。底边两根带都比指令少收 2.3~2.7 mm，顶边≈0，是收带方向的系统性滞后，不是单轴故障。
+- 机械侧证据：同一份日志的放带段，TL 到 316 mm 时 ADC 仅 35，而 BL 到 509 mm 时 446.7、BR 到 594 mm 时 349.8，PWM 都已顶到 1023。放带本该最省力却顶满输出，说明 BL/BR 路径阻力明显大于顶边；收带更费劲，滞后就落在这两根上。**抬高门槛只会掩盖机械阻力**，方向应是查卷轴绕线叠层、导向轮与带的空程。
+- 固件侧处置：`failApplyTension` 的 readyHold 分支不再第一次失败就 `markBeltPositionsStale()`。连续 3 次落定失败才判废（`MaslowCalibrationStability::maxConsecutiveSettleFailures`），落定成功清零。判定线与超时未改。
+- 日志判读：保留基准时出 WARN `Ready hold stopped: motion endpoint did not settle; belt_reference_valid=1 error_mm … ; reference kept, miss 1/3, apply tension again before moving`；判废时出 ERR `… ; belt reference voided, run Retract/Extend before moving`。看到 `miss 2/3` 就该停下来查机械，不要连点三次把基准点废。
+- 恢复动作：出现 WARN 后**不必收放带**，清报警（如需）→ 直接点张紧 → 继续点动。出现 `belt reference voided` 才需要完整收带/放带。
+- 回退：刷回 `20261113-143500-保持环突破静摩擦-firmware.bin`（SHA `4b80e693…0ccc`）即回到「一次失败即判废」的旧行为；该镜像不含 16:40 的 `maxDrivePWM=800`，回退会同时退掉张紧采样权限，需一并考虑。
+- 遗留：settle 段走 `MotorUnit::recomputeMotionPID()`，是纯 P + ±1023 限幅，**没有** breakaway assist（assist 只在 `recomputeCalibrationHold()` 里）。这才是「差 2.7 mm 就静坐 4 s」的机理。若机械侧查不出阻力来源，下一步是让 settle 段也能用带 assist 的保持环，而不是继续放宽门槛。
