@@ -53,6 +53,11 @@ public:
     bool     recomputeMotionPID();
     bool     recomputeCalibrationHold();
     double   getCalibrationHoldVelocity() const { return calibrationHold.velocity(); }
+    // ms the hold loop has spent at the breakaway assist cap without moving.
+    // Non-zero for ~2 s means the belt cannot follow even at full hold authority
+    // (jam / over-tension), which is a different fault from a slow settle.
+    uint32_t getCalibrationHoldStuckMs() const { return calibrationHold.stuckMs(); }
+    double   getCalibrationHoldAssist() const { return calibrationHold.assistOutput(); }
     void     decompressBelt();
     void     driveOut(int speed);  // Drive motor outward at specified PWM speed (0-1023)
     bool     comply();

@@ -1984,6 +1984,16 @@ bool Calibration::takeStableHorizontalMeasurement(float result[4], int current, 
                 return failHorizontalSampling("保位编码器数据过期或无效", 1U << arm, true);
         }
         diagnosticTightMask = 15U;
+        // Separates "cannot move at all" from "did not finish settling".  The
+        // breakaway assist runs to its cap only when the axis is off target and
+        // stationary, so time spent there means no duty this loop may use can
+        // produce motion: a jam or an over-tensioned belt, not a slow settle.
+        unsigned holdStuck = 0;
+        for (int arm = _TL; arm < ARM_COUNT; ++arm) {
+            if (Maslow.axis[arm].getCalibrationHoldStuckMs() >= MaslowCalibrationHold::breakawayStuckLimitMs)
+                holdStuck |= 1U << arm;
+        }
+        if (holdStuck) return failHorizontalSampling("保位加力到上限仍无位移（疑似卡滞或过紧）", holdStuck, true);
     }
 
     unsigned holdConflict = 0;

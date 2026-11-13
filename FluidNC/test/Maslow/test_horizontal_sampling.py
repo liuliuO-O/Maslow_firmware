@@ -100,6 +100,7 @@ struct Axis {
     uint32_t getEncoderReadFailures(){return failures;}
     uint32_t getEncoderLargeSteps(){return steps;}
     uint32_t getDriveLossEvents(){return driveLossEvents;}
+    uint32_t getCalibrationHoldStuckMs(){return 0;}
     uint32_t driveLossEvents=0;
     void setTarget(double p){target=p;++sets;}
     void stop(){pwm=0;++stops;}

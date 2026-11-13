@@ -87,12 +87,14 @@ int main(){
  }
  assert(crossed&&last<0);
  // Same position error: motion toward the target produces less drive than no motion.
+ // Keep the error inside the breakaway band so this measures damping, not the assist.
  Controller moving,stationary;
  for(uint32_t t=0;t<=800;t+=4) {
-   assert(moving.update(t,-1,0));assert(stationary.update(t,-.98,0));
+   assert(moving.update(t,-.2,0));assert(stationary.update(t,-.18,0));
  }
- assert(moving.update(804,-.98,0));assert(stationary.update(804,-.98,0));
+ assert(moving.update(804,-.18,0));assert(stationary.update(804,-.18,0));
  assert(moving.velocity()>0&&moving.output()<stationary.output());
+ assert(std::fabs(moving.output())<maxDrivePWM-1);
  assert(!moving.update(905,-.98,0));assert(moving.output()==0);
  assert(!moving.update(906,std::numeric_limits<double>::quiet_NaN(),0));
  assert(moving.output()==0);
@@ -101,6 +103,99 @@ int main(){
  c.reset();assert(c.output()==0&&!c.active());
  assert(c.update(0xfffffff0U,-1,0));assert(c.update(0x4U,-1,0));
  assert(c.output()<=maxSlewPWMPerSecond*.020+1e-9);
+}
+""")
+
+    def test_breakaway_assist_closes_static_friction_offset(self):
+        """2026-11-13 wp=1: pure P parked BR at 1.149 mm / 395 PWM and timed out.
+
+        The four measured (error, pwm) pairs all sit on the P curve, so the loop
+        was in exact steady state, not saturated.  A plant that only moves above a
+        stiction threshold reproduces that deadlock, and the assist must break it
+        without leaving a standing force behind.
+        """
+        self.run_cpp(r"""
+#include "CalibrationHoldController.h"
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+using namespace MaslowCalibrationHold;
+
+// Belt needs more than 'stick' duty to move; below that it is held by friction.
+struct Plant {
+    double pos, stick, rate;
+    void step(double drive, double dt) {
+        if (std::fabs(drive) > stick) pos += (drive < 0 ? -1.0 : 1.0) * rate * dt;
+    }
+};
+
+// The old law, for the regression that documents the deadlock.
+double oldDrive(double kp, double error) {
+    return Controller::driveForEffort(kp * error);
+}
+
+int main(){
+ // 1) Old pure-P law parks at 1.15 mm and never moves again.
+ {
+   Plant p{1.149, 420.0, 1.5};
+   double drive = 0;
+   for (int i = 0; i < 2000; ++i) {           // 8 s at 4 ms
+     const double error = -p.pos;
+     drive = oldDrive(proportionalGain, error);
+     p.step(drive, 0.004);
+   }
+   assert(std::fabs(p.pos) > 1.0);            // still outside the 1 mm gate
+   assert(std::fabs(drive - (-394.0)) < 3.0); // parked on the P curve, not at the cap
+ }
+ // 2) Production controller breaks away and settles inside the gate.
+ {
+   Plant p{1.149, 420.0, 1.5};
+   Controller c;
+   assert(c.update(0, p.pos, 0));
+   uint32_t now = 0;
+   bool inside = false;
+   for (int i = 0; i < 2000; ++i) {
+     now += 4;
+     c.update(now, p.pos, 0);
+     p.step(c.output(), 0.004);
+     if (std::fabs(p.pos) <= 0.25) inside = true;
+   }
+   assert(inside);
+   assert(std::fabs(p.pos) < 0.35);           // well inside the 1 mm sampling gate
+   assert(c.assistOutput() == 0.0);           // released once it could move
+   assert(c.stuckMs() == 0);
+ }
+ // 3) Assist stays idle when the axis is already on target (no creep).
+ {
+   Controller c;
+   c.update(0, 0.05, 0);
+   for (uint32_t t = 4; t <= 4000; t += 4) c.update(t, 0.05, 0);
+   assert(c.assistOutput() == 0.0);
+ }
+ // 4) A belt that cannot move at all saturates the cap and reports the stall.
+ {
+   Plant p{1.149, 100000.0, 1.5};
+   Controller c;
+   c.update(0, p.pos, 0);
+   for (uint32_t t = 4; t <= 4000; t += 4) c.update(t, p.pos, 0);
+   assert(c.assistOutput() >= breakawayLimitPwm - 1.0);
+   assert(c.stuckMs() >= breakawayStuckLimitMs);
+   assert(c.atLimit());
+ }
+ // 5) Reset and reference changes clear the learned assist.
+ {
+   Controller c;
+   c.update(0, 5.0, 0);
+   for (uint32_t t = 4; t <= 1500; t += 4) c.update(t, 5.0, 0);
+   assert(c.assistOutput() > 0.0);
+   c.reset();
+   assert(c.assistOutput() == 0.0 && c.stuckMs() == 0);
+   c.update(2000, 5.0, 0);
+   for (uint32_t t = 2004; t <= 3000; t += 4) c.update(t, 5.0, 0);
+   assert(c.assistOutput() > 0.0);
+   c.update(3004, 5.0, -1.0);                 // new reference
+   assert(c.assistOutput() == 0.0);
+ }
 }
 """)
 
