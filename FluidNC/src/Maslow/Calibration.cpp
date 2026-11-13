@@ -697,6 +697,17 @@ void Calibration::diagnosticSnapshot() {
                  << " current_adc=" << axis.getMotorCurrent()
                  << " enc_fail_run=" << (axis.getEncoderReadFailures() - diagnosticEncoderBaseline[arm]));
     }
+    // Compact four-arm trace at the same 500 ms cadence.  INFO level so it is
+    // visible without enabling debug: the 11-13 run showed a dead BR drive, but
+    // per-arm debug snapshots were suppressed and the exact moment it died was
+    // unrecoverable.  Format: <label>=pos,current,pwm per arm.
+    log_info("CALDIAG trace"
+             << " TL=" << Maslow.axis[_TL].getPosition() << "," << Maslow.axis[_TL].getMotorCurrent()
+             << "," << Maslow.axis[_TL].getMotorPower() << " TR=" << Maslow.axis[_TR].getPosition() << ","
+             << Maslow.axis[_TR].getMotorCurrent() << "," << Maslow.axis[_TR].getMotorPower()
+             << " BL=" << Maslow.axis[_BL].getPosition() << "," << Maslow.axis[_BL].getMotorCurrent()
+             << "," << Maslow.axis[_BL].getMotorPower() << " BR=" << Maslow.axis[_BR].getPosition() << ","
+             << Maslow.axis[_BR].getMotorCurrent() << "," << Maslow.axis[_BR].getMotorPower());
 }
 
 // Logging has no authority over motor outputs, errors, or calibration state.
