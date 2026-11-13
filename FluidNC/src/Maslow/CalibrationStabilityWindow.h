@@ -7,6 +7,19 @@ constexpr uint32_t stableDurationMs = 750;
 constexpr uint32_t maxObservationGapMs = 100;
 constexpr float maxSpanMm = 0.5f;
 constexpr float maxPositionErrorMm = 1.0f;
+// Settling gate after a jog/cycle.  It must tolerate the machine's own geometry
+// residual: on 2026-11-13 the best achievable four-belt residual was 2.26 mm, so
+// a 1 mm gate could never be met once the sled moved (TR parked at 2.08 mm and
+// the hold aborted 1.5 s after every move).
+constexpr float maxSettleErrorMm = 2.5f;
+constexpr uint32_t motionSettleTimeoutMs = 4000;
+// A missed settle invalidates the belt reference only after this many
+// consecutive misses.  The gate above is what defines "missed"; this constant
+// only decides how much a single miss costs the operator.  Keeping it at 1
+// meant a 0.24 mm overshoot (BR 2.742 mm on 2026-11-13 18:2x) threw away a
+// valid reference and forced a full retract/extend.  Repeated misses still
+// void the reference, so a machine that cannot settle does not quietly drift.
+constexpr uint8_t maxConsecutiveSettleFailures = 3;
 
 struct Diagnostics {
     unsigned spanResetMask = 0;

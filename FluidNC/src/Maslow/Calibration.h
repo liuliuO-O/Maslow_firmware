@@ -149,6 +149,9 @@ private:
         MaslowCalibrationStability::Window stability;
     } applyTensionRecovery;
     bool savedAnchorHoldActive = false;
+    // Consecutive missed settles since the last accepted one.  Bounds how often
+    // a precision failure may keep the NVS belt reference instead of voiding it.
+    uint8_t settleFailureStreak = 0;
     bool beginApplyTension();
     bool failApplyTension(const char* reason, bool referenceInvalid);
     bool applyTensionFeedbackHealthy(uint32_t now);

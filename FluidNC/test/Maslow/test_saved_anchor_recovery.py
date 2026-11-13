@@ -63,6 +63,9 @@ class SavedAnchorRecoveryTest(unittest.TestCase):
     def test_motion_settles_before_ready_hold_and_save(self):
         self.check('settle')
 
+    def test_repeated_settle_misses_void_the_reference_after_three(self):
+        self.check('settle_streak')
+
 
 HARNESS = r'''
 #include <algorithm>
@@ -116,7 +119,7 @@ struct Axis {
     }
     bool recomputeCalibrationHold() {
         ++holds;
-        pwm=std::clamp(300*(target-position),-600.,600.);
+        pwm=std::clamp(300*(target-position),-MaslowCalibrationHold::maxDrivePWM,MaslowCalibrationHold::maxDrivePWM);
         return holdHealthy;
     }
 };
@@ -125,12 +128,12 @@ struct Maslow_ {
     Axis axis[4];
     float scaleX=1, scaleY=1;
     float workAreaX=500, workAreaY=300, workAreaCenterOffsetX=0, workAreaCenterOffsetY=0;
-    int motionUpdates=0, positionSaves=0;
+    int motionUpdates=0, positionSaves=0, staleMarks=0;
     void stopMotors();
     void recomputePID() { ++motionUpdates; }
     void saveZPos() {}
     void saveBeltPositions() { ++positionSaves; }
-    void markBeltPositionsStale() {}
+    void markBeltPositionsStale() { ++staleMarks; }
 } Maslow;
 struct Kinematics {
     float getCenterX() const { return 493; }
@@ -200,10 +203,12 @@ void finish() {
     for (int i=0;i<600 && !done;++i) done=tick();
     assert(done);
 }
-void stopped(int expectedState, bool homed) {
+// Quality failures hand control back as Idle/EXTENDEDOUT and keep the reference;
+// only a lost reference alarms.  See failApplyTension.
+void stopped(int expectedState, bool homed, State expectedSys=State::Alarm) {
     auto& c=Maslow.calibration;
     assert(c.currentState==expectedState && c.all_axis_homed()==homed);
-    assert(sys.value==State::Alarm && readyTransitions==0);
+    assert(sys.value==expectedSys && readyTransitions==0);
     assert(!c.applyTensionRecovery.active && !c.savedAnchorHoldActive);
     for (const auto& a:Maslow.axis) assert(a.pwm==0);
 }
@@ -255,18 +260,43 @@ int main(int argc,char**argv) {
         assert(Maslow.axis[0].getTarget()==target);
         assert(c.beginSavedAnchorMotionSettling());
         Maslow.axis[0].position+=8;
-        clockMs+=1450;
+        clockMs=c.applyTensionRecovery.motionSettlingStarted+3950;
         assert(c.maintainSavedAnchorHold());
         Maslow.axis[0].position=target+.25;
         assert(c.maintainSavedAnchorHold());
         clockMs+=50;
         assert(c.maintainSavedAnchorHold());
         assert(std::any_of(logs.begin(), logs.end(), [](const auto& line) {
-            return line.find("MOTION_SETTLE result=stopped elapsed_ms=1500 longest_in_tolerance_ms=50")!=std::string::npos
+            return line.find("MOTION_SETTLE result=stopped elapsed_ms=4000 longest_in_tolerance_ms=50")!=std::string::npos
                 && line.find("outside_mask=1 peak_error_mm TL=8")!=std::string::npos;
         }));
-        assert(sys.value==State::Alarm && c.currentState==EXTENDEDOUT && c.all_axis_homed());
+        // One missed settle is a precision failure, not a lost reference.
+        assert(sys.value==State::Idle && c.currentState==EXTENDEDOUT && c.all_axis_homed());
+        assert(Maslow.staleMarks==0 && c.settleFailureStreak==1);
         assert(Maslow.positionSaves==1);
+    } else if (scenario=="settle_streak") {
+        prepare(); begin(); finish();
+        // The first two misses keep the reference so Apply Tension can be retried
+        // without a retract/extend cycle.
+        assert(c.failApplyTension("motion endpoint did not settle", false));
+        assert(Maslow.staleMarks==0 && c.settleFailureStreak==1 && sys.value==State::Idle && c.all_axis_homed());
+        c.currentState=READY_TO_CUT;
+        assert(c.failApplyTension("motion endpoint did not settle", false));
+        assert(Maslow.staleMarks==0 && c.settleFailureStreak==2);
+        c.currentState=READY_TO_CUT;
+        // The third consecutive miss falls back to the strict rule.
+        assert(c.failApplyTension("motion endpoint did not settle", false));
+        assert(Maslow.staleMarks==1 && c.settleFailureStreak==0 && sys.value==State::Idle);
+        assert(std::any_of(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("reference kept, miss 2/3")!=std::string::npos;
+        }));
+        assert(std::any_of(logs.begin(), logs.end(), [](const auto& line) {
+            return line.find("belt reference voided")!=std::string::npos;
+        }));
+        // A lost reference still alarms and clears the homed flags immediately.
+        prepare(); begin(); finish();
+        assert(c.failApplyTension("encoder feedback lost while holding Ready position", true));
+        assert(Maslow.staleMarks==1 && sys.value==State::Alarm && !c.all_axis_homed() && c.currentState==UNKNOWN);
     } else if (scenario=="no_response") {
         prepare();
         auto& br = Maslow.axis[_BR];
@@ -274,7 +304,7 @@ int main(int argc,char**argv) {
         br.noCurrent=true;
         begin();
         finish();
-        stopped(EXTENDEDOUT,true);
+        stopped(EXTENDEDOUT,true,State::Idle);
         assert(clockMs>=5700 && clockMs<6500);
         assert(std::any_of(logs.begin(),logs.end(),[](const auto& line) {
             return line.find("RESTORE_NO_RESPONSE belt=BR")!=std::string::npos;
@@ -297,9 +327,9 @@ int main(int argc,char**argv) {
         for (const auto& a:Maslow.axis) assert(a.pulls==0);
         prepare();begin();prime();++Maslow.axis[2].failures;assert(tick());stopped(UNKNOWN,false);
         prepare();begin();prime();Maslow.axis[3].fresh=false;assert(tick());stopped(UNKNOWN,false);
-        prepare();begin();Maslow.axis[0].position-=301;assert(tick());stopped(EXTENDEDOUT,true);
-        prepare();begin();assert(tick(30000));stopped(EXTENDEDOUT,true);
-        prepare();begin();assert(tick(60000));stopped(EXTENDEDOUT,true);
+        prepare();begin();Maslow.axis[0].position-=301;assert(tick());stopped(EXTENDEDOUT,true,State::Idle);
+        prepare();begin();assert(tick(30000));stopped(EXTENDEDOUT,true,State::Idle);
+        prepare();begin();assert(tick(60000));stopped(EXTENDEDOUT,true,State::Idle);
 
         prepare();begin();prime();
         int preloadUpdates=Maslow.axis[0].pulls;
@@ -309,14 +339,14 @@ int main(int argc,char**argv) {
             Maslow.axis[0].position=Maslow.axis[0].target+(i%2?0.75:-0.75);
             done=tick();
         }
-        assert(done);stopped(EXTENDEDOUT,true);
+        assert(done);stopped(EXTENDEDOUT,true,State::Idle);
         assert(std::any_of(logs.begin(), logs.end(), [](const auto& line) {
             return line.find("RESTORE_SAMPLE result=stopped snapshots=0 position_error_mask=0 pwm_limit_mask=0 span_reset_mask=1")!=std::string::npos;
         }));
         for (const auto& axis:Maslow.axis) assert(axis.pulls==preloadUpdates);
 
         prepare();begin();prime();Maslow.axis[0].position+=8;
-        assert(!tick());assert(tick(1500));stopped(EXTENDEDOUT,true);
+        assert(!tick());assert(tick(1500));stopped(EXTENDEDOUT,true,State::Idle);
     } else if (scenario=="geometry") {
         // Four lengths within the failed log's printed rounding, including the low-residual case.
         const FieldGeometry field;
@@ -348,11 +378,11 @@ int main(int argc,char**argv) {
         for (double& length:lengths) length=500;
         assert(!MaslowSavedAnchorRecovery::fitPosition(lengths,[](int,double,double){return 500.;},[](){}).converged);
 
-        prepare(12,-8,6);begin();finish();stopped(EXTENDEDOUT,true);
+        prepare(12,-8,6);begin();finish();stopped(EXTENDEDOUT,true,State::Idle);
         prepare(12,-8,6);c.applyTensionMaxResidualMm=5;begin();finish();assert(readyTransitions==1);
-        prepare(300,0);begin();finish();stopped(EXTENDEDOUT,true);
+        prepare(300,0);begin();finish();stopped(EXTENDEDOUT,true,State::Idle);
     } else if (scenario=="retry") {
-        prepare();begin();prime();assert(tick(12000));stopped(EXTENDEDOUT,true);
+        prepare();begin();prime();assert(tick(12000));stopped(EXTENDEDOUT,true,State::Idle);
         // Acknowledging a quality failure needs no new home or anchor fit.
         sys.set_state(State::Idle);begin();finish();
         assert(readyTransitions==1 && c.all_axis_homed());

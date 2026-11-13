@@ -8,7 +8,17 @@ namespace MaslowCalibrationHold {
 constexpr double proportionalGain = 300.0;
 constexpr double velocityDamping = 8.0;          // PWM / (mm/s), derivative on measurement.
 constexpr double velocityFilterSeconds = 0.020;
-constexpr double maxDrivePWM = 600.0;           // Effective bridge duty, after compensation.
+// Effective bridge duty, after compensation.  Preload may legally reach 1023 to
+// establish the reference tension, so a 600 cap left the hold loop unable to
+// maintain what preload had just built: on 2026-11-13 16:2x the four belts hit
+// 762 ADC at 640/724/630/452 PWM, and TR (724) plus TL (640) were already over
+// 600 before sampling began.  The hold saturated at 599, which is also the
+// sampling gate, so every 750 ms window reset and 12 s elapsed with only 3
+// snapshots.  Positions never moved (position_error_mask=0, span <0.02 mm), so
+// this is an authority mismatch, not a mechanical stall.  800 clears the worst
+// measured axis with margin while staying under the 900-923 ADC current seen
+// during real tightening.
+constexpr double maxDrivePWM = 800.0;
 constexpr double maxSlewPWMPerSecond = 2500.0;
 constexpr uint32_t maxFeedbackGapMs = 100;
 

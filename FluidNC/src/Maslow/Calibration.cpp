@@ -1411,9 +1411,12 @@ void Calibration::calibration_loop() {
 // Restore a pose using saved anchors. No anchor fitting or configuration write occurs here.
 bool Calibration::beginApplyTension() {
     const auto kinematics = getKinematics();
+    // Keep this range identical to the MachineConfig handler for the same key.
+    // They used to be 0.5..5.0 here and 0.5..8.0 there, so raising the limit at
+    // runtime made Apply Tension silently refuse to start.
     if (!all_axis_homed() || !allAxisExtended() || !kinematics || retractCurrentThreshold <= 0
         || !std::isfinite(applyTensionMaxResidualMm)
-        || applyTensionMaxResidualMm < 0.5f || applyTensionMaxResidualMm > 5.0f) return false;
+        || applyTensionMaxResidualMm < 0.5f || applyTensionMaxResidualMm > 8.0f) return false;
 
     const uint32_t now = static_cast<uint32_t>(millis());
     ApplyTensionRecoveryState next;
@@ -1456,12 +1459,37 @@ bool Calibration::failApplyTension(const char* reason, bool referenceInvalid) {
     // Do not persist failed measurements as a valid position reference.
     // A quality failure alone does not invalidate a continuous encoder zero.
     currentState = referenceInvalid ? UNKNOWN : EXTENDEDOUT;
-    sys.set_state(State::Alarm);
+    // A quality failure still has a valid belt reference and the belts are still
+    // on the anchors, so hand control back as Idle/EXTENDEDOUT: the operator can
+    // press Apply Tension again immediately.  Only a lost or discontinuous
+    // reference (position_error / encoder failure) alarms and requires a restart.
+    sys.set_state(referenceInvalid ? State::Alarm : State::Idle);
     if (readyHold) {
-        Maslow.markBeltPositionsStale();
-        log_error("Ready hold stopped: " << reason << "; belt_reference_valid=" << !referenceInvalid
-                  << " error_mm TL=" << Maslow.axis[_TL].getPositionError() << " TR=" << Maslow.axis[_TR].getPositionError()
-                  << " BL=" << Maslow.axis[_BL].getPositionError() << " BR=" << Maslow.axis[_BR].getPositionError());
+        // A missed settle is a precision failure, not a lost reference, so it may
+        // keep the reference for a bounded number of consecutive misses.  Voiding
+        // NVS on the first miss turned a 0.24 mm overshoot (BR 2.742 mm on
+        // 2026-11-13 18:2x) into a full retract/extend cycle even though the log
+        // itself reported belt_reference_valid=1.  The gate that decided the miss
+        // is untouched: only the price of the first two misses changes, and the
+        // third one still voids the reference, so an axis that cannot settle
+        // stays visible instead of creeping.
+        const bool voidReference =
+            referenceInvalid || ++settleFailureStreak >= MaslowCalibrationStability::maxConsecutiveSettleFailures;
+        if (voidReference) {
+            Maslow.markBeltPositionsStale();
+            settleFailureStreak = 0;
+            log_error("Ready hold stopped: " << reason << "; belt_reference_valid=" << !referenceInvalid
+                      << " error_mm TL=" << Maslow.axis[_TL].getPositionError() << " TR=" << Maslow.axis[_TR].getPositionError()
+                      << " BL=" << Maslow.axis[_BL].getPositionError() << " BR=" << Maslow.axis[_BR].getPositionError()
+                      << "; belt reference voided, run Retract/Extend before moving");
+        } else {
+            log_warn("Ready hold stopped: " << reason << "; belt_reference_valid=1"
+                     << " error_mm TL=" << Maslow.axis[_TL].getPositionError() << " TR=" << Maslow.axis[_TR].getPositionError()
+                     << " BL=" << Maslow.axis[_BL].getPositionError() << " BR=" << Maslow.axis[_BR].getPositionError()
+                     << "; reference kept, miss " << static_cast<int>(settleFailureStreak) << "/"
+                     << static_cast<int>(MaslowCalibrationStability::maxConsecutiveSettleFailures)
+                     << ", apply tension again before moving");
+        }
     } else {
         log_error("Apply Tension stopped: " << reason << "; belt_reference_valid=" << !referenceInvalid);
     }
@@ -1506,7 +1534,7 @@ bool Calibration::updateApplyTensionHold(uint32_t now) {
 bool Calibration::savedAnchorHoldSettled() {
     for (int arm = _TL; arm < ARM_COUNT; ++arm) {
         auto& axis = Maslow.axis[arm];
-        if (!(std::fabs(axis.getPositionError()) <= MaslowCalibrationStability::maxPositionErrorMm)) return false;
+        if (!(std::fabs(axis.getPositionError()) <= MaslowCalibrationStability::maxSettleErrorMm)) return false;
     }
     return true;
 }
@@ -1529,7 +1557,7 @@ void Calibration::logSavedAnchorSettling(const char* result, uint32_t now) const
     log_info("MOTION_SETTLE result=" << result
              << " elapsed_ms=" << static_cast<unsigned>(now - recovery.motionSettlingStarted)
              << " longest_in_tolerance_ms=" << static_cast<unsigned>(recovery.longestMotionWithinToleranceMs)
-             << " required_ms=100 limit_mm=" << MaslowCalibrationStability::maxPositionErrorMm
+             << " required_ms=100 limit_mm=" << MaslowCalibrationStability::maxSettleErrorMm
              << " outside_mask=" << recovery.motionOutsideToleranceMask
              << " peak_error_mm TL=" << recovery.motionPeakError[_TL] << " TR=" << recovery.motionPeakError[_TR]
              << " BL=" << recovery.motionPeakError[_BL] << " BR=" << recovery.motionPeakError[_BR]);
@@ -1571,7 +1599,7 @@ bool Calibration::maintainSavedAnchorHold() {
         for (int arm = _TL; arm < ARM_COUNT; ++arm) {
             const double error = Maslow.axis[arm].getPositionError();
             if (std::fabs(error) > std::fabs(recovery.motionPeakError[arm])) recovery.motionPeakError[arm] = error;
-            if (!(std::fabs(error) <= MaslowCalibrationStability::maxPositionErrorMm))
+            if (!(std::fabs(error) <= MaslowCalibrationStability::maxSettleErrorMm))
                 recovery.motionOutsideToleranceMask |= 1u << arm;
         }
         if (withinTolerance) {
@@ -1581,10 +1609,11 @@ bool Calibration::maintainSavedAnchorHold() {
 
         if (withinTolerance && now - recovery.motionWithinToleranceSince >= 100) {
             recovery.motionSettling = false;
+            settleFailureStreak    = 0;
             Maslow.saveZPos();
             Maslow.saveBeltPositions();
             logSavedAnchorSettling("settled", now);
-        } else if (now - recovery.motionSettlingStarted >= 1500) {
+        } else if (now - recovery.motionSettlingStarted >= MaslowCalibrationStability::motionSettleTimeoutMs) {
             return failApplyTension("motion endpoint did not settle", false);
         } else {
             // Keep tracking the final planned belt targets with the motion

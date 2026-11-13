@@ -173,8 +173,10 @@ int main(){
    assert(c.assistOutput() == 0.0);
  }
  // 4) A belt that cannot move at all saturates the cap and reports the stall.
+ // The cap is 800 since the 16:40 build, so a 1.149 mm error plus the 380 assist
+ // (746 effective) no longer saturates it; the plant starts outside that range.
  {
-   Plant p{1.149, 100000.0, 1.5};
+   Plant p{1.8, 100000.0, 1.5};
    Controller c;
    c.update(0, p.pos, 0);
    for (uint32_t t = 4; t <= 4000; t += 4) c.update(t, p.pos, 0);

@@ -105,7 +105,7 @@ namespace Machine {
         handler.item(M + "_Acceptable_Calibration_Threshold", Maslow.calibration.acceptableCalibrationThreshold, 0, 1);
         handler.item(M + "_Apply_Tension_Belt_Retraction_Limit", Maslow.calibration.applyTensionBeltRetractionLimitMm, 0.0, 4250.0);
         handler.item(M + "_Apply_Tension_Allow_Limiting", Maslow.calibration.applyTensionAllowLimiting);
-        handler.item(M + "_Apply_Tension_Max_Residual_Mm", Maslow.calibration.applyTensionMaxResidualMm, 0.5, 5.0);
+        handler.item(M + "_Apply_Tension_Max_Residual_Mm", Maslow.calibration.applyTensionMaxResidualMm, 0.5, 8.0);
         handler.item(M + "_Extend_Dist", Maslow.calibration.extendDist, 0, 4250);
 
         handler.item(M + "_Jog_Max_Feed", Maslow.jogMaxFeed, 1.0f, 10000.0f);

@@ -210,9 +210,15 @@ void Maslow_::update() {
     static int prevMaslowState    = calibration.getCurrentState();
     int        currentMaslowState = calibration.getCurrentState();
     if (prevMaslowState != currentMaslowState) {
-        // If we're leaving READY_TO_CUT, RETRACTED, or EXTENDEDOUT, mark positions as stale
-        if ((prevMaslowState == READY_TO_CUT || prevMaslowState == RETRACTED || prevMaslowState == EXTENDEDOUT) &&
-            (currentMaslowState != READY_TO_CUT && currentMaslowState != RETRACTED && currentMaslowState != EXTENDEDOUT)) {
+        // TAKING_SLACK is a normal step of Apply Tension: the belts stay on the
+        // anchors and the reference stays valid, so it must NOT invalidate NVS.
+        // Previously entering Apply Tension alone wiped beltValid, so any failed
+        // tension forced a full retract/extend cycle after the next reboot.
+        const bool wasValid = prevMaslowState == READY_TO_CUT || prevMaslowState == RETRACTED ||
+                              prevMaslowState == EXTENDEDOUT;
+        const bool stillValid = currentMaslowState == READY_TO_CUT || currentMaslowState == RETRACTED ||
+                                currentMaslowState == EXTENDEDOUT || currentMaslowState == TAKING_SLACK;
+        if (wasValid && !stillValid) {
             markBeltPositionsStale();
         }
         prevMaslowState = currentMaslowState;
